@@ -1,0 +1,16 @@
+alembic==1.16.5
+boto3==1.42.1
+celery==5.6.0
+fastapi==0.124.0
+httpx==0.28.1
+orjson==3.11.5
+psycopg[binary]==3.2.13
+pydantic==2.12.5
+pydantic-settings==2.12.0
+pytest==9.0.1
+python-dotenv==1.2.1
+python-json-logger==4.0.0
+lark-oapi==1.4.8
+redis==7.1.0
+sqlalchemy==2.0.45
+uvicorn[standard]==0.38.0

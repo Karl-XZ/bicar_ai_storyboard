@@ -1,0 +1,759 @@
+from __future__ import annotations
+
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urlparse
+
+from sqlalchemy.orm import Session
+
+from app.adapters.feishu import FeishuClient
+from app.adapters.feishu_cards import batch_done_card, progress_card, project_created_card
+from app.adapters.feishu_fields import bitable_field_definitions, build_field_map
+from app.core.config import settings
+from app.domain.enums import AssetType, Satisfaction, ShotStatus
+from app.domain.schemas import CreateProjectRequest
+from app.models.asset import Asset
+from app.models.project import Project
+from app.models.shot import Shot
+from app.services.assets import AssetService
+from app.services.projects import ProjectService
+from app.services.shots import (
+    GENERATION_STATUS_DONE,
+    GENERATION_STATUS_GENERATING,
+    GENERATION_STATUS_NOT_STARTED,
+    GENERATION_STATUS_STARTED,
+    STATUS_TO_FEISHU,
+    ShotService,
+)
+from app.services.workflow import WorkflowError, WorkflowService
+
+
+@dataclass(frozen=True)
+class ProvisionedProject:
+    project: Project
+    table_url: str | None
+    folder_url: str | None
+
+
+class FeishuStoryboardService:
+    def __init__(self, db: Session, feishu: FeishuClient | None = None) -> None:
+        self.db = db
+        self.feishu = feishu or FeishuClient()
+        self.projects = ProjectService(db)
+        self.shots = ShotService(db)
+
+    async def create_project_from_bot(self, *, project_name: str, chat_id: str | None = None) -> ProvisionedProject:
+        project = self.projects.create_project(CreateProjectRequest(name=project_name))
+        resources = await self._provision_feishu_resources(project)
+        project = self.projects.update_feishu_resources(
+            project,
+            app_token=resources["app_token"],
+            table_id=resources["table_id"],
+            folder_token=resources["project_folder_token"],
+            workflow_config={
+                "table_url": resources.get("table_url"),
+                "folder_url": resources.get("folder_url"),
+                "folders": resources["folders"],
+                "chat_id": chat_id or settings.feishu_default_chat_id,
+            },
+        )
+        target_chat = chat_id or settings.feishu_default_chat_id
+        if target_chat:
+            await self.feishu.send_card(
+                target_chat,
+                project_created_card(
+                    project_id=str(project.id),
+                    project_name=project.name,
+                    table_url=resources.get("table_url"),
+                    folder_url=resources.get("folder_url"),
+                ),
+            )
+        return ProvisionedProject(project=project, table_url=resources.get("table_url"), folder_url=resources.get("folder_url"))
+
+    async def sync_from_feishu(self, project: Project) -> list[Shot]:
+        if not project.feishu_app_token or not project.feishu_table_id:
+            return []
+        await self.ensure_table_fields(project)
+        response = await self.feishu.search_records(project.feishu_app_token, project.feishu_table_id, {})
+        records = response.get("data", {}).get("items", [])
+        if not records:
+            await self.ensure_starter_records(project)
+            return []
+        await self._apply_record_defaults(project, records)
+        synced: list[Shot] = []
+        for record in records:
+            shot = self.shots.upsert_from_feishu_record(project_id=project.id, record=record)
+            if shot:
+                synced.append(shot)
+        self.db.commit()
+        return synced
+
+    async def optimize_current_batch(self, *, project: Project, batch_no: str = "batch_001") -> list[Shot]:
+        await self.sync_from_feishu(project)
+        workflow = WorkflowService(self.db)
+        shots = self.projects.list_shots(project.id, batch_no=batch_no)
+        for shot in shots:
+            await workflow.optimize_prompt_async(shot.id)
+            self.db.refresh(shot)
+            self._set_prompt_value(shot, "review_status", "待生成帧")
+            await self.backfill_shots(project, [shot])
+        return shots
+
+    async def generate_current_batch(self, *, project: Project, batch_no: str = "batch_001") -> list[Shot]:
+        await self.sync_from_feishu(project)
+        shots = self.projects.list_shots(project.id, batch_no=batch_no)
+        generated = await self._generate_images_for_shots(project, shots)
+        target_chat = (project.workflow_config or {}).get("chat_id") or settings.feishu_default_chat_id
+        if target_chat:
+            await self.feishu.send_card(
+                target_chat,
+                batch_done_card(
+                    project_id=str(project.id),
+                    batch_no=batch_no,
+                    rows=[(shot.shot_no, "成功") for shot in generated],
+                ),
+            )
+        return generated
+
+    async def generate_all_images(self, project: Project) -> list[Shot]:
+        await self.sync_from_feishu(project)
+        shots = self.projects.list_shots(project.id)
+        return await self._generate_images_for_shots(project, shots)
+
+    async def generate_all_videos(self, project: Project, *, only_started: bool = False) -> list[Shot]:
+        await self.sync_from_feishu(project)
+        shots = self.projects.list_shots(project.id)
+        generated: list[Shot] = []
+        for shot in shots:
+            generation_status = (shot.prompts or {}).get("generation_status") or GENERATION_STATUS_NOT_STARTED
+            if only_started and generation_status != GENERATION_STATUS_STARTED:
+                continue
+            if not only_started and generation_status == GENERATION_STATUS_DONE:
+                continue
+            if not self._video_ready(shot):
+                continue
+            if await self.generate_shot_video(project, shot, force=only_started):
+                generated.append(shot)
+        return generated
+
+    async def generate_all_images_and_videos(self, project: Project) -> dict[str, int]:
+        images = await self.generate_all_images(project)
+        videos = await self.generate_all_videos(project)
+        return {"images": len(images), "videos": len(videos)}
+
+    async def enable_keyframe_generation(self, project: Project) -> None:
+        project.workflow_config = {**(project.workflow_config or {}), "keyframe_generation_enabled": True}
+        self.db.commit()
+
+    async def enable_transition_alignment(self, project: Project) -> int:
+        config = {**(project.workflow_config or {}), "transition_alignment_enabled": True}
+        project.workflow_config = config
+        self.db.commit()
+        return await self.sync_tail_to_next_first_frame(project)
+
+    async def sync_tail_to_next_first_frame(self, project: Project) -> int:
+        await self.sync_from_feishu(project)
+        shots = self.projects.list_shots(project.id)
+        synced: list[Shot] = []
+        for previous, current in zip(shots, shots[1:]):
+            if await self._sync_tail_to_first_frame(project, previous, current):
+                synced.append(current)
+        self.db.commit()
+        if synced:
+            await self.backfill_shots(project, synced)
+        return len(synced)
+
+    async def _sync_tail_to_first_frame(self, project: Project, previous: Shot, current: Shot) -> bool:
+        asset_service = AssetService(self.db)
+        tail = asset_service.latest_for_shot(previous.id, AssetType.LAST_FRAME)
+        if not tail:
+            return False
+        latest_first = asset_service.latest_for_shot(current.id, AssetType.FIRST_FRAME)
+        if (
+            latest_first
+            and latest_first.provider == "transition_alignment"
+            and latest_first.prompt_hash == tail.prompt_hash
+            and (current.prompts or {}).get("transition_source_shot_no") == previous.shot_no
+        ):
+            return True
+        path = Path(tail.storage_uri.replace("file://", ""))
+        if not path.exists():
+            return False
+        asset_service.put_bytes(
+            project_id=current.project_id,
+            shot_id=current.id,
+            asset_type=AssetType.FIRST_FRAME,
+            content=path.read_bytes(),
+            filename=f"frames/{current.shot_no}/v{current.prompt_version:03d}_first_frame_synced_from_{previous.shot_no}.png",
+            provider="transition_alignment",
+            model_id=tail.model_id,
+            prompt_hash=tail.prompt_hash,
+            version=current.prompt_version,
+        )
+        self._set_prompt_value(current, "transition_source_shot_no", previous.shot_no)
+        self.db.flush()
+        return True
+
+    async def generate_shot_video(self, project: Project, shot: Shot, *, force: bool = False) -> bool:
+        workflow = WorkflowService(self.db)
+        if not force and (shot.prompts or {}).get("generation_status") == GENERATION_STATUS_DONE:
+            if AssetService(self.db).latest_for_shot(shot.id, AssetType.VIDEO):
+                await self.backfill_shots(project, [shot])
+                return False
+        if force:
+            self._set_prompt_value(shot, "video_run_id", int((shot.prompts or {}).get("video_run_id") or 0) + 1)
+        self._set_prompt_value(shot, "generation_status", GENERATION_STATUS_GENERATING)
+        shot.status = ShotStatus.VIDEO_GENERATING.value
+        shot.error_code = None
+        shot.error_message = None
+        self.db.commit()
+        await self.backfill_shots(project, [shot])
+        try:
+            await workflow.generate_video_async(shot.id, force=force)
+            self.db.refresh(shot)
+            self._set_prompt_value(shot, "generation_status", GENERATION_STATUS_DONE)
+            shot.error_code = None
+            shot.error_message = None
+            self.db.commit()
+            await self.backfill_shots(project, [shot])
+            return True
+        except WorkflowError as exc:
+            self._set_prompt_value(shot, "generation_status", GENERATION_STATUS_NOT_STARTED)
+            shot.error_code = exc.code
+            shot.error_message = exc.message
+            self.db.commit()
+            await self.backfill_shots(project, [shot])
+            return False
+        except Exception as exc:
+            self._set_prompt_value(shot, "generation_status", GENERATION_STATUS_NOT_STARTED)
+            shot.error_code = type(exc).__name__
+            shot.error_message = str(exc)
+            self.db.commit()
+            await self.backfill_shots(project, [shot])
+            return False
+
+    async def _generate_images_for_shots(
+        self,
+        project: Project,
+        shots: list[Shot],
+        *,
+        force: bool = False,
+        only_started: bool = False,
+    ) -> list[Shot]:
+        workflow = WorkflowService(self.db)
+        generated: list[Shot] = []
+        transition_enabled = bool((project.workflow_config or {}).get("transition_alignment_enabled"))
+        keyframes_enabled = bool((project.workflow_config or {}).get("keyframe_generation_enabled"))
+        ordered_shots = self.projects.list_shots(project.id) if transition_enabled else shots
+        previous_by_id = {current.id: previous for previous, current in zip(ordered_shots, ordered_shots[1:])}
+        for index, shot in enumerate(shots):
+            image_status = (shot.prompts or {}).get("image_generation_status") or GENERATION_STATUS_NOT_STARTED
+            if only_started and image_status != GENERATION_STATUS_STARTED:
+                continue
+            if not force and image_status == GENERATION_STATUS_DONE:
+                continue
+            if force:
+                self._set_prompt_value(shot, "image_run_id", int((shot.prompts or {}).get("image_run_id") or 0) + 1)
+            self._set_prompt_value(shot, "image_generation_status", GENERATION_STATUS_GENERATING)
+            shot.status = ShotStatus.FRAMES_GENERATING.value
+            shot.error_code = None
+            shot.error_message = None
+            self.db.commit()
+            await self.backfill_shots(project, [shot])
+            try:
+                if not shot.prompts or not any(value for key, value in (shot.prompts or {}).items() if key.endswith("_prompt")):
+                    await workflow.optimize_prompt_async(shot.id)
+                    self.db.refresh(shot)
+                    self._set_prompt_value(shot, "review_status", "待生成帧")
+                    await self.backfill_shots(project, [shot])
+                include_first = True
+                previous = previous_by_id.get(shot.id)
+                if transition_enabled and previous:
+                    synced = await self._sync_tail_to_first_frame(project, previous, shot)
+                    include_first = not bool(synced)
+                await workflow.generate_frames_async(
+                    shot.id,
+                    include_first_frame=include_first,
+                    include_last_frame=True,
+                    include_keyframes=keyframes_enabled,
+                    force=force,
+                )
+                self.db.refresh(shot)
+                self._set_prompt_value(shot, "review_status", "待审核")
+                self._set_prompt_value(shot, "image_generation_status", GENERATION_STATUS_DONE)
+                shot.error_code = None
+                shot.error_message = None
+                generated.append(shot)
+                self.db.commit()
+                await self.backfill_shots(project, [shot])
+            except WorkflowError as exc:
+                self._set_prompt_value(shot, "image_generation_status", GENERATION_STATUS_NOT_STARTED)
+                shot.error_code = exc.code
+                shot.error_message = exc.message
+                self.db.commit()
+                await self.backfill_shots(project, [shot])
+            except Exception as exc:
+                self._set_prompt_value(shot, "image_generation_status", GENERATION_STATUS_NOT_STARTED)
+                shot.error_code = type(exc).__name__
+                shot.error_message = str(exc)
+                self.db.commit()
+                await self.backfill_shots(project, [shot])
+        return generated
+
+    async def backfill_shots(self, project: Project, shots: list[Shot]) -> None:
+        if not project.feishu_app_token or not project.feishu_table_id:
+            return
+        asset_service = AssetService(self.db)
+        folders = (project.workflow_config or {}).get("folders", {})
+        records = []
+        for shot in shots:
+            fields = {
+                "关键帧提示词": (shot.prompts or {}).get("keyframe_prompt", ""),
+                "首帧提示词": (shot.prompts or {}).get("first_frame_prompt", ""),
+                "尾帧提示词": (shot.prompts or {}).get("last_frame_prompt", ""),
+                "视频 Prompt": (shot.prompts or {}).get("video_prompt", ""),
+                "负面 Prompt": (shot.prompts or {}).get("negative_prompt", ""),
+                "镜头运动": (shot.prompts or {}).get("camera_motion", ""),
+                "一致性说明": (shot.prompts or {}).get("consistency_notes", ""),
+                "文本模型": (shot.prompts or {}).get("text_model") or self._project_model(project, "text"),
+                "图片模型": (shot.prompts or {}).get("image_model") or self._project_model(project, "image"),
+                "视频模型": (shot.prompts or {}).get("video_model") or self._project_model(project, "video"),
+                "审核状态": self._review_status_for_shot(shot),
+                "图片生成状态": self._image_generation_status_for_shot(shot),
+                "生成状态": self._generation_status_for_shot(shot),
+                "Prompt 版本": shot.prompt_version,
+                "错误信息": shot.error_message or "",
+            }
+            await self._attach_assets(project, shot, fields, asset_service, folders)
+            if shot.feishu_record_id:
+                records.append({"record_id": shot.feishu_record_id, "fields": fields})
+        if records:
+            await self.feishu.batch_update_records(project.feishu_app_token, project.feishu_table_id, records)
+        self.db.commit()
+
+    async def send_progress(self, project: Project, chat_id: str | None = None) -> dict:
+        await self.sync_from_feishu(project)
+        stats = self.progress_stats(project)
+        card = progress_card(
+            project_name=project.name,
+            stats=stats,
+            table_url=(project.workflow_config or {}).get("table_url"),
+            project_id=str(project.id),
+        )
+        target = chat_id or (project.workflow_config or {}).get("chat_id") or settings.feishu_default_chat_id
+        if target:
+            await self.feishu.send_card(target, card)
+        return stats
+
+    async def ensure_starter_records(self, project: Project, count: int = 3) -> int:
+        if not project.feishu_app_token or not project.feishu_table_id:
+            return 0
+        await self.ensure_table_fields(project)
+        response = await self.feishu.search_records(project.feishu_app_token, project.feishu_table_id, {})
+        records = response.get("data", {}).get("items", [])
+        if records:
+            await self._apply_record_defaults(project, records)
+            return 0
+        used_shot_numbers = set()
+        starter_records = []
+        next_index = 1
+        while len(records) + len(starter_records) < count:
+            while f"{next_index:03d}" in used_shot_numbers:
+                next_index += 1
+            shot_no = f"{next_index:03d}"
+            used_shot_numbers.add(shot_no)
+            starter_records.append({"fields": self._default_record_fields(project, shot_no=shot_no)})
+        if not starter_records:
+            return 0
+        await self.feishu.batch_create_records(project.feishu_app_token, project.feishu_table_id, starter_records)
+        return len(starter_records)
+
+    async def ensure_table_fields(self, project: Project) -> list[str]:
+        if not project.feishu_app_token or not project.feishu_table_id:
+            return []
+        fields_response = await self.feishu.list_fields(project.feishu_app_token, project.feishu_table_id)
+        field_map = build_field_map(fields_response)
+        created: list[str] = []
+        for definition in bitable_field_definitions():
+            name = definition.get("field_name")
+            if name and name not in field_map:
+                await self.feishu.create_field(project.feishu_app_token, project.feishu_table_id, definition)
+                created.append(name)
+        return created
+
+    def progress_stats(self, project: Project) -> dict:
+        shots = self.projects.list_shots(project.id)
+        asset_service = AssetService(self.db)
+        prompt_optimized = sum(1 for shot in shots if (shot.prompts or {}).get("video_prompt"))
+        first_frames = sum(1 for shot in shots if asset_service.latest_for_shot(shot.id, AssetType.FIRST_FRAME))
+        last_frames = sum(1 for shot in shots if asset_service.latest_for_shot(shot.id, AssetType.LAST_FRAME))
+        keyframe_shots = sum(1 for shot in shots if asset_service.list_for_shot(shot.id, AssetType.KEYFRAME))
+        videos = sum(1 for shot in shots if asset_service.latest_for_shot(shot.id, AssetType.VIDEO))
+        image_generating = sum(
+            1
+            for shot in shots
+            if (shot.prompts or {}).get("image_generation_status") in {GENERATION_STATUS_STARTED, GENERATION_STATUS_GENERATING}
+        )
+        image_done = sum(
+            1
+            for shot in shots
+            if (shot.prompts or {}).get("image_generation_status") == GENERATION_STATUS_DONE
+            or asset_service.latest_for_shot(shot.id, AssetType.FIRST_FRAME)
+            or asset_service.latest_for_shot(shot.id, AssetType.LAST_FRAME)
+            or asset_service.list_for_shot(shot.id, AssetType.KEYFRAME)
+        )
+        video_generating = sum(
+            1
+            for shot in shots
+            if (shot.prompts or {}).get("generation_status") in {GENERATION_STATUS_STARTED, GENERATION_STATUS_GENERATING}
+        )
+        video_done = sum(
+            1
+            for shot in shots
+            if (shot.prompts or {}).get("generation_status") == GENERATION_STATUS_DONE
+            or asset_service.latest_for_shot(shot.id, AssetType.VIDEO)
+        )
+        error_items = [
+            {"shot_no": shot.shot_no, "code": shot.error_code, "message": shot.error_message}
+            for shot in shots
+            if shot.error_code or shot.error_message
+        ]
+        return {
+            "total": len(shots),
+            "prompt_optimized": prompt_optimized,
+            "prompt_pending": max(len(shots) - prompt_optimized, 0),
+            "first_frames": first_frames,
+            "last_frames": last_frames,
+            "keyframe_shots": keyframe_shots,
+            "videos": videos,
+            "image_generating": image_generating,
+            "image_done": image_done,
+            "video_done": video_done,
+            "errors": len(error_items),
+            "error_items": error_items[:5],
+            "log_paths": self._log_paths(),
+            "transition_alignment_enabled": bool((project.workflow_config or {}).get("transition_alignment_enabled")),
+            "keyframe_generation_enabled": bool((project.workflow_config or {}).get("keyframe_generation_enabled")),
+            "pending_frames": sum(1 for shot in shots if shot.status == ShotStatus.PENDING_FRAMES.value),
+            "frames_generating": image_generating,
+            "pending_review": sum(1 for shot in shots if shot.status == ShotStatus.PENDING_REVIEW.value),
+            "video_generating": video_generating,
+            "pending_acceptance": sum(1 for shot in shots if shot.status == ShotStatus.PENDING_ACCEPTANCE.value),
+            "archived": sum(
+                1
+                for shot in shots
+                if shot.status in {ShotStatus.ARCHIVED_SATISFIED.value, ShotStatus.ARCHIVED_UNSATISFIED.value}
+            ),
+        }
+
+    async def process_record_status(self, *, project: Project, record: dict) -> Shot | None:
+        shot = self.shots.upsert_from_feishu_record(project_id=project.id, record=record)
+        if not shot:
+            return None
+
+        workflow = WorkflowService(self.db)
+        should_backfill = False
+        image_generation_status = self._field_text((record.get("fields") or {}).get("图片生成状态"))
+        if image_generation_status == GENERATION_STATUS_STARTED:
+            await self._generate_images_for_shots(project, [shot], force=True, only_started=True)
+            self.db.refresh(shot)
+
+        generation_status = self._field_text((record.get("fields") or {}).get("生成状态"))
+        if generation_status == GENERATION_STATUS_STARTED:
+            await self.generate_shot_video(project, shot, force=True)
+            self.db.refresh(shot)
+
+        satisfaction_text = self._field_text((record.get("fields") or {}).get("满意度"))
+        if satisfaction_text == "满意":
+            workflow.archive_shot(shot.id, Satisfaction.SATISFIED)
+            should_backfill = True
+        elif satisfaction_text == "不满意":
+            workflow.archive_shot(shot.id, Satisfaction.UNSATISFIED)
+            should_backfill = True
+
+        self.db.refresh(shot)
+        if should_backfill:
+            await self.backfill_shots(project, [shot])
+        else:
+            self.db.commit()
+        return shot
+
+    async def _provision_feishu_resources(self, project: Project) -> dict:
+        project_folder = await self.feishu.create_folder(settings.feishu_root_folder_token or "root", project.name)
+        project_folder_token = self._extract_token(project_folder)
+        folders = {}
+        for key, name in {
+            "references": "01_参考图",
+            "frames": "02_帧图",
+            "videos": "03_视频",
+            "satisfied": "05_通过_满意",
+            "unsatisfied": "06_需重做_不满意",
+        }.items():
+            folder = await self.feishu.create_folder(project_folder_token, name)
+            folders[key] = self._extract_token(folder)
+        bitable = await self.feishu.create_bitable_app(f"{project.name}_分镜表", folder_token=project_folder_token)
+        app_token = self._extract_app_token(bitable)
+        table = await self.feishu.create_table(app_token, "分镜表", bitable_field_definitions())
+        table_id = self._extract_table_id(table)
+        await self.feishu.subscribe_file_events(app_token, "bitable")
+        await self.feishu.batch_create_records(
+            app_token,
+            table_id,
+            [
+                {"fields": self._default_record_fields(project, shot_no=f"{index:03d}")}
+                for index in range(1, 4)
+            ],
+        )
+        app_url = self._extract_url(bitable)
+        return {
+            "project_folder_token": project_folder_token,
+            "folders": folders,
+            "app_token": app_token,
+            "table_id": table_id,
+            "table_url": self._bitable_table_url(app_url, app_token, table_id),
+            "folder_url": self._extract_url(project_folder) or self._drive_url(project_folder_token),
+        }
+
+    async def _attach_assets(
+        self,
+        project: Project,
+        shot: Shot,
+        fields: dict,
+        asset_service: AssetService,
+        folders: dict,
+    ) -> None:
+        mapping = {
+            "首帧图": (AssetType.FIRST_FRAME, folders.get("frames")),
+            "尾帧图": (AssetType.LAST_FRAME, folders.get("frames")),
+            "关键帧图": (AssetType.KEYFRAME, folders.get("frames")),
+            "视频链接": (AssetType.VIDEO, folders.get("videos")),
+            "归档链接": (AssetType.ARCHIVE, self._archive_folder_for_status(shot, folders)),
+        }
+        for field_name, (asset_type, folder_token) in mapping.items():
+            assets = asset_service.list_for_shot(shot.id, asset_type)
+            if not assets:
+                continue
+            if asset_type in {AssetType.VIDEO, AssetType.ARCHIVE}:
+                asset = assets[-1]
+                link = asset.public_url
+                if folder_token:
+                    token = await self._upload_drive_asset(asset, folder_token)
+                    if token:
+                        link = self._drive_file_url(project, token)
+                fields[field_name] = {"link": link, "text": Path(asset.storage_uri).name}
+                continue
+            display_assets = assets[-1:] if asset_type in {AssetType.FIRST_FRAME, AssetType.LAST_FRAME} else assets
+            if not folder_token:
+                fields[field_name] = "\n".join(asset.public_url or asset.storage_uri for asset in display_assets)
+                continue
+            file_tokens = []
+            for asset in display_assets:
+                await self._upload_drive_asset(asset, folder_token)
+                token = await self._upload_bitable_asset(project, asset)
+                if token:
+                    file_tokens.append({"file_token": token})
+            if file_tokens:
+                fields[field_name] = file_tokens
+                if asset_type == AssetType.KEYFRAME and "选中关键帧图" not in fields:
+                    fields["选中关键帧图"] = [file_tokens[0]]
+
+    async def _upload_drive_asset(self, asset: Asset, folder_token: str) -> str | None:
+        if asset.feishu_drive_token:
+            return asset.feishu_drive_token
+        path = Path(asset.storage_uri.replace("file://", ""))
+        if not path.exists():
+            return None
+        response = await self.feishu.upload_file(folder_token, path.name, path.read_bytes())
+        token = self._extract_file_token(response)
+        if token:
+            asset.feishu_drive_token = token
+            self.db.flush()
+        return token
+
+    async def _upload_bitable_asset(self, project: Project, asset: Asset) -> str | None:
+        if asset.feishu_file_token:
+            return asset.feishu_file_token
+        if not project.feishu_app_token:
+            return None
+        path = Path(asset.storage_uri.replace("file://", ""))
+        if not path.exists():
+            return None
+        response = await self.feishu.upload_bitable_attachment(project.feishu_app_token, path.name, path.read_bytes())
+        token = self._extract_file_token(response)
+        if token:
+            asset.feishu_file_token = token
+            self.db.flush()
+        return token
+
+    def _archive_folder_for_status(self, shot: Shot, folders: dict) -> str | None:
+        if shot.status == ShotStatus.ARCHIVED_UNSATISFIED.value:
+            return folders.get("unsatisfied")
+        return folders.get("satisfied")
+
+    async def _apply_record_defaults(self, project: Project, records: list[dict]) -> None:
+        if not project.feishu_app_token or not project.feishu_table_id:
+            return
+        used_shot_numbers = {
+            self._field_text((record.get("fields") or {}).get("镜号"))
+            for record in records
+            if self._field_text((record.get("fields") or {}).get("镜号"))
+        }
+        next_index = 1
+        updates = []
+        for record in records:
+            fields = record.setdefault("fields", {})
+            defaults = {}
+            if not self._field_text(fields.get("镜号")):
+                while f"{next_index:03d}" in used_shot_numbers:
+                    next_index += 1
+                shot_no = f"{next_index:03d}"
+                defaults["镜号"] = shot_no
+                used_shot_numbers.add(shot_no)
+            for key, value in self._default_record_fields(project).items():
+                if key == "镜号":
+                    continue
+                if not self._field_text(fields.get(key)):
+                    defaults[key] = value
+            if defaults and record.get("record_id"):
+                fields.update(defaults)
+                updates.append({"record_id": record["record_id"], "fields": defaults})
+        if updates:
+            await self.feishu.batch_update_records(project.feishu_app_token, project.feishu_table_id, updates)
+
+    def _default_record_fields(self, project: Project, shot_no: str | None = None) -> dict:
+        fields = {
+            "生成批次": "batch_001",
+            "审核状态": "草稿",
+            "图片生成状态": GENERATION_STATUS_NOT_STARTED,
+            "生成状态": GENERATION_STATUS_NOT_STARTED,
+            "Prompt 版本": 1,
+            "文本模型": self._project_model(project, "text"),
+            "图片模型": self._project_model(project, "image"),
+            "视频模型": self._project_model(project, "video"),
+        }
+        if shot_no:
+            fields["镜号"] = shot_no
+        return fields
+
+    def _review_status_for_shot(self, shot: Shot) -> str:
+        review_status = (shot.prompts or {}).get("review_status")
+        if review_status:
+            return str(review_status)
+        if shot.status in {
+            ShotStatus.PENDING_REVIEW.value,
+            ShotStatus.APPROVED.value,
+            ShotStatus.VIDEO_GENERATING.value,
+            ShotStatus.PENDING_ACCEPTANCE.value,
+            ShotStatus.ARCHIVED_SATISFIED.value,
+            ShotStatus.ARCHIVED_UNSATISFIED.value,
+        }:
+            return "待审核"
+        return STATUS_TO_FEISHU.get(shot.status, "草稿")
+
+    def _generation_status_for_shot(self, shot: Shot) -> str:
+        generation_status = (shot.prompts or {}).get("generation_status")
+        if generation_status in {GENERATION_STATUS_STARTED, GENERATION_STATUS_GENERATING, GENERATION_STATUS_DONE}:
+            return str(generation_status)
+        if shot.status == ShotStatus.VIDEO_GENERATING.value:
+            return GENERATION_STATUS_GENERATING
+        if shot.status in {
+            ShotStatus.PENDING_ACCEPTANCE.value,
+            ShotStatus.ARCHIVED_SATISFIED.value,
+            ShotStatus.ARCHIVED_UNSATISFIED.value,
+        } or AssetService(self.db).latest_for_shot(shot.id, AssetType.VIDEO):
+            return GENERATION_STATUS_DONE
+        if generation_status:
+            return str(generation_status)
+        return GENERATION_STATUS_NOT_STARTED
+
+    def _image_generation_status_for_shot(self, shot: Shot) -> str:
+        image_generation_status = (shot.prompts or {}).get("image_generation_status")
+        if image_generation_status in {GENERATION_STATUS_STARTED, GENERATION_STATUS_GENERATING, GENERATION_STATUS_DONE}:
+            return str(image_generation_status)
+        if shot.status == ShotStatus.FRAMES_GENERATING.value:
+            return GENERATION_STATUS_GENERATING
+        asset_service = AssetService(self.db)
+        if (
+            shot.status == ShotStatus.PENDING_REVIEW.value
+            or asset_service.latest_for_shot(shot.id, AssetType.FIRST_FRAME)
+            or asset_service.latest_for_shot(shot.id, AssetType.LAST_FRAME)
+            or asset_service.list_for_shot(shot.id, AssetType.KEYFRAME)
+        ):
+            return GENERATION_STATUS_DONE
+        if image_generation_status:
+            return str(image_generation_status)
+        return GENERATION_STATUS_NOT_STARTED
+
+    def _set_prompt_value(self, shot: Shot, key: str, value) -> None:
+        shot.prompts = {**(shot.prompts or {}), key: value}
+        self.db.flush()
+
+    def _video_ready(self, shot: Shot) -> bool:
+        return bool((shot.prompts or {}).get("video_prompt") or shot.scene_description)
+
+    def _extract_token(self, response: dict) -> str:
+        data = response.get("data", {})
+        return data.get("token") or data.get("file_token") or data.get("folder_token") or data.get("node", {}).get("token") or ""
+
+    def _extract_file_token(self, response: dict) -> str | None:
+        data = response.get("data", {})
+        return data.get("file_token") or data.get("file", {}).get("file_token")
+
+    def _extract_app_token(self, response: dict) -> str:
+        data = response.get("data", {})
+        return data.get("app_token") or data.get("app", {}).get("app_token") or data.get("token") or ""
+
+    def _extract_table_id(self, response: dict) -> str:
+        data = response.get("data", {})
+        return data.get("table_id") or data.get("table", {}).get("table_id") or ""
+
+    def _extract_url(self, response: dict) -> str | None:
+        data = response.get("data", {})
+        return data.get("url") or data.get("app", {}).get("url")
+
+    def _drive_url(self, token: str) -> str:
+        domain = settings.feishu_base_url.replace("https://open.", "").replace("http://open.", "")
+        return f"https://{domain}/drive/folder/{token}"
+
+    def _drive_file_url(self, project: Project, token: str) -> str:
+        return f"{self._project_site_url(project)}/drive/file/{token}"
+
+    def _project_site_url(self, project: Project) -> str:
+        for key in ("table_url", "folder_url"):
+            url = (project.workflow_config or {}).get(key)
+            if not url:
+                continue
+            parsed = urlparse(str(url))
+            if parsed.netloc:
+                return f"{parsed.scheme or 'https'}://{parsed.netloc}"
+        return self._feishu_site_url()
+
+    def _bitable_table_url(self, app_url: str | None, app_token: str, table_id: str) -> str:
+        base_url = app_url or f"{self._feishu_site_url()}/base/{app_token}"
+        separator = "&" if "?" in base_url else "?"
+        return f"{base_url}{separator}table={table_id}"
+
+    def _feishu_site_url(self) -> str:
+        domain = settings.feishu_base_url.replace("https://open.", "").replace("http://open.", "")
+        return f"https://{domain}"
+
+    def _field_text(self, value) -> str:
+        if value is None:
+            return ""
+        if isinstance(value, str):
+            return value.strip()
+        if isinstance(value, dict):
+            return str(value.get("text") or value.get("name") or "").strip()
+        if isinstance(value, list):
+            return "".join(self._field_text(item) for item in value).strip()
+        return str(value).strip()
+
+    def _project_model(self, project: Project, kind: str) -> str:
+        return str(((project.model_config or {}).get(kind) or {}).get("model_id") or "")
+
+    def _log_paths(self) -> list[str]:
+        backend_root = Path(__file__).resolve().parents[2]
+        return [
+            str((backend_root / "backend-api.err").resolve()),
+            str((backend_root / "feishu-ws.err").resolve()),
+        ]

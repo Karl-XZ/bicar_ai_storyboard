@@ -1,0 +1,30 @@
+# Local secrets
+backend/.env
+.env
+
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+
+# Node
+node_modules/
+dist/
+
+# Local logs
+*.log
+*.err
+*.out
+
+# Local runtime data
+backend/local_storage/
+local_storage/
+
+# Bundled archives
+*.zip
+
+# macOS archive metadata
+__MACOSX/
+._*
+.DS_Store
