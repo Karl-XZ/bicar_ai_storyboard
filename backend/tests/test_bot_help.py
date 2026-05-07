@@ -1,6 +1,6 @@
 from app.adapters.feishu_cards import help_card
 from app.api.routes.webhooks import _is_help_command, _message_text
-from app.services.bot_commands import _parse_create_project_command, _parse_project_command
+from app.services.bot_commands import _parse_chatbot_model_command, _parse_create_project_command, _parse_project_command
 
 
 def test_help_command_aliases():
@@ -52,3 +52,8 @@ def test_text_project_commands_parse_to_card_actions():
         "batch_no": "batch_001",
     }
     assert _parse_project_command("同步表格") == {"action": "project.sync", "batch_no": "batch_001"}
+
+
+def test_chatbot_model_command_allows_new_providers():
+    assert _parse_chatbot_model_command("切换chatbot模型 deepseek-v4-pro") == "deepseek-v4-pro"
+    assert _parse_chatbot_model_command("chatbot模型 google/gemini-3.1-pro-preview") == "google/gemini-3.1-pro-preview"

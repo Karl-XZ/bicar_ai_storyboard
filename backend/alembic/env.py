@@ -7,6 +7,7 @@ from app.core.config import settings
 from app.models.asset import Asset
 from app.models.audit import AuditLog, CostLog
 from app.models.base import Base
+from app.models.chat_message import ChatMessage
 from app.models.job import GenerationJob
 from app.models.project import Project
 from app.models.shot import Shot
@@ -19,7 +20,7 @@ if config.config_file_name is not None:
 
 target_metadata = Base.metadata
 
-_models = (Asset, AuditLog, CostLog, GenerationJob, Project, Shot)
+_models = (Asset, AuditLog, ChatMessage, CostLog, GenerationJob, Project, Shot)
 
 
 def run_migrations_offline() -> None:
@@ -47,4 +48,3 @@ if context.is_offline_mode():
     run_migrations_offline()
 else:
     run_migrations_online()
-

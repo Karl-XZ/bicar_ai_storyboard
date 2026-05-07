@@ -370,8 +370,10 @@ class WorkflowService:
         project = self.projects.get_project(shot.project_id)
         config = ((project.model_config or {}).get(kind) or {}) if project else {}
         prompts = shot.prompts or {}
-        model_id = str(prompts.get(f"{kind}_model") or config.get("model_id") or self._default_model(kind))
-        provider = str(config.get("provider") or self._default_provider(kind))
+        configured_provider = str(config.get("provider") or self._default_provider(kind))
+        configured_model = prompts.get(f"{kind}_model") or config.get("model_id")
+        provider = configured_provider
+        model_id = str(configured_model or self._default_model(kind, configured_provider))
         provider = self._infer_provider(kind=kind, provider=provider, model_id=model_id)
         return provider, model_id
 
@@ -382,31 +384,64 @@ class WorkflowService:
             "video": settings.default_video_provider,
         }[kind]
 
-    def _default_model(self, kind: str) -> str:
+    def _default_model(self, kind: str, provider: str | None = None) -> str:
+        selected = provider or self._default_provider(kind)
+        if kind == "text":
+            return {
+                "dashscope": settings.dashscope_text_model,
+                "openai": settings.openai_text_model,
+                "deepseek": settings.deepseek_text_model,
+                "openrouter": settings.openrouter_text_model,
+            }.get(selected, settings.dashscope_text_model)
+        if kind == "image":
+            return {
+                "dashscope": settings.dashscope_image_model,
+                "openai": settings.openai_image_model,
+                "nano_banana_2": settings.nano_banana_model,
+                "openrouter": settings.openrouter_image_model,
+            }.get(selected, settings.dashscope_image_model)
         return {
-            "text": settings.dashscope_text_model,
-            "image": settings.dashscope_image_model,
-            "video": settings.dashscope_video_model,
-        }[kind]
+            "dashscope": settings.dashscope_video_model,
+            "seedance_2_0": settings.seedance_model_id or settings.dashscope_video_model,
+            "xyq_nest": settings.xyq_video_model,
+        }.get(selected, settings.dashscope_video_model)
 
     def _infer_provider(self, *, kind: str, provider: str, model_id: str) -> str:
+        normalized = model_id.lower().replace("-", "_").replace("/", "_")
+        inferred = None
+        if normalized in {"mock", "mock_text", "mock_image", "mock_video"}:
+            inferred = "mock"
+        elif normalized in {"nano_banana_2", "gemini_3.1_flash_image_preview"}:
+            inferred = "nano_banana_2" if settings.google_api_key else "openrouter"
+        elif normalized.startswith("deepseek_v4") or normalized.startswith("deepseek_chat") or normalized.startswith("deepseek_reasoner"):
+            inferred = "deepseek"
+        elif normalized in {"gpt_image_2", "gpt_image_1"}:
+            inferred = "openai"
+        elif normalized.startswith(("qwen", "wan", "z_image")):
+            inferred = "dashscope"
+        elif normalized.startswith("seedance"):
+            inferred = "seedance_2_0"
+        elif normalized.startswith(("xyq", "xiaoyunque", "xiao_yunque")):
+            inferred = "xyq_nest"
+        elif normalized.startswith(("google_gemini", "openai_gpt", "anthropic_", "x_ai_", "meta_llama", "mistralai_", "moonshotai_")):
+            inferred = "openrouter"
+        elif normalized.startswith("gpt"):
+            inferred = "openai"
+
+        if normalized in {"mock", "mock_text", "mock_image", "mock_video"}:
+            return "mock"
         if provider and provider != "auto":
             if kind == "image" and provider == "gpt_image_2":
                 return "openai"
             if kind == "video" and provider == "seedance":
                 return "seedance_2_0"
+            if kind == "video" and provider in {"xyq", "xiao_yunque"}:
+                return "xyq_nest"
+            if inferred and inferred != provider:
+                return inferred
             return provider
-        normalized = model_id.lower().replace("-", "_")
-        if normalized in {"mock", "mock_text", "mock_image", "mock_video"}:
-            return "mock"
-        if normalized in {"nano_banana_2", "gemini_3.1_flash_image_preview"}:
-            return "nano_banana_2"
-        if normalized in {"gpt_image_2", "gpt_image_1"} or normalized.startswith("gpt"):
-            return "openai"
-        if normalized.startswith(("qwen", "wan", "z_image")):
-            return "dashscope"
-        if normalized.startswith("seedance"):
-            return "seedance_2_0"
+        if inferred:
+            return inferred
         return provider or self._default_provider(kind)
 
     def _frame_prompt(self, shot: Shot, frame_type: FrameType) -> str:

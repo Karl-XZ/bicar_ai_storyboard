@@ -76,6 +76,7 @@ class ProjectService:
             for project in projects:
                 if (project.workflow_config or {}).get("chat_id") == chat_id:
                     return project
+            return None
         return projects[0] if projects else None
 
     def update_feishu_resources(

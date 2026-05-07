@@ -1,11 +1,15 @@
 from app.core.config import settings
 from app.providers.base import ImageProvider, TextProvider, VideoProvider
+from app.providers.deepseek_text import DeepSeekTextProvider
 from app.providers.dashscope import DashScopeImageProvider, DashScopeTextProvider, DashScopeVideoProvider
 from app.providers.google_image import GoogleNanoBanana2Provider
 from app.providers.mock import MockImageProvider, MockTextProvider, MockVideoProvider
 from app.providers.openai_image import OpenAIImageProvider
 from app.providers.openai_text import OpenAITextProvider
+from app.providers.openrouter_image import OpenRouterImageProvider
+from app.providers.openrouter_text import OpenRouterTextProvider
 from app.providers.seedance import Seedance20VideoProvider
+from app.providers.xyq_nest import XYQNestVideoProvider
 
 
 class ProviderRouter:
@@ -13,6 +17,10 @@ class ProviderRouter:
         selected = provider or settings.default_text_provider
         if selected == "dashscope" and settings.dashscope_api_key:
             return DashScopeTextProvider()
+        if selected == "deepseek" and settings.deepseek_api_key:
+            return DeepSeekTextProvider()
+        if selected == "openrouter" and settings.openrouter_api_key:
+            return OpenRouterTextProvider()
         if selected == "openai" and settings.openai_api_key:
             return OpenAITextProvider()
         return MockTextProvider()
@@ -25,6 +33,8 @@ class ProviderRouter:
             return OpenAIImageProvider()
         if selected == "nano_banana_2" and settings.google_api_key:
             return GoogleNanoBanana2Provider()
+        if selected == "openrouter" and settings.openrouter_api_key:
+            return OpenRouterImageProvider()
         return MockImageProvider()
 
     def video(self, provider: str | None = None) -> VideoProvider:
@@ -33,4 +43,6 @@ class ProviderRouter:
             return DashScopeVideoProvider()
         if selected == "seedance_2_0" and settings.seedance_api_key and settings.seedance_base_url:
             return Seedance20VideoProvider()
+        if selected == "xyq_nest" and settings.xyq_access_key:
+            return XYQNestVideoProvider()
         return MockVideoProvider()

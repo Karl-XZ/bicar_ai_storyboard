@@ -1,0 +1,362 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import mimetypes
+from dataclasses import dataclass
+from pathlib import Path
+from urllib.parse import urlparse
+
+import httpx
+
+from app.core.config import settings
+from app.providers.base import VideoProvider, VideoTaskResult
+
+SUBMIT_RUN_PATH = "/api/biz/v1/skill/submit_run"
+GET_THREAD_PATH = "/api/biz/v1/skill/get_thread"
+UPLOAD_FILE_PATH = "/api/biz/v1/skill/upload_file"
+VIDEO_SUFFIXES = (".mp4", ".mov", ".webm", ".m4v", ".avi", ".mkv")
+
+
+class XYQNestProviderError(RuntimeError):
+    pass
+
+
+@dataclass(frozen=True)
+class _UploadedAsset:
+    label: str
+    asset_id: str
+
+
+@dataclass(frozen=True)
+class _TaskRef:
+    thread_id: str
+    run_id: str
+    web_thread_link: str | None = None
+
+
+class XYQNestVideoProvider(VideoProvider):
+    async def create_video_task(self, payload: dict) -> VideoTaskResult:
+        access_key = _require_access_key()
+        uploaded_assets = await _upload_assets_from_payload(payload, access_key)
+        body = {
+            "message": _build_video_message(payload, uploaded_assets),
+        }
+        if uploaded_assets:
+            body["asset_ids"] = [asset.asset_id for asset in uploaded_assets]
+        data = await _api_post(path=SUBMIT_RUN_PATH, access_key=access_key, body=body, timeout=60)
+        run = data.get("run") or {}
+        thread_id = str(run.get("thread_id") or "").strip()
+        run_id = str(run.get("run_id") or "").strip()
+        if not thread_id or not run_id:
+            raise XYQNestProviderError("XYQ submit_run did not return thread_id/run_id")
+        return VideoTaskResult(
+            provider_task_id=_encode_task_ref(
+                _TaskRef(
+                    thread_id=thread_id,
+                    run_id=run_id,
+                    web_thread_link=str(data.get("web_thread_link") or "").strip() or None,
+                )
+            )
+        )
+
+    async def poll_video_task(self, provider_task_id: str) -> dict:
+        access_key = _require_access_key()
+        task_ref = _decode_task_ref(provider_task_id)
+        attempts = max(int(settings.video_max_polling_attempts), 1)
+        interval = max(int(settings.video_polling_interval_seconds), 1)
+        last_message = ""
+        for attempt in range(attempts):
+            data = await _api_post(
+                path=GET_THREAD_PATH,
+                access_key=access_key,
+                body={"thread_id": task_ref.thread_id, "run_id": task_ref.run_id, "after_seq": 0},
+                timeout=60,
+            )
+            thread = data.get("thread") or {}
+            run_list = thread.get("run_list") or []
+            if not run_list:
+                raise XYQNestProviderError("XYQ get_thread did not return run_list")
+            run = run_list[0] or {}
+            run_state = _normalize_run_state(run.get("state"))
+            last_message = _extract_text_summary(run) or last_message
+
+            if run_state == 3:
+                result_url = _extract_result_url(run)
+                if not result_url:
+                    detail = f"：{last_message}" if last_message else ""
+                    raise XYQNestProviderError(f"XYQ task finished without a downloadable result{detail}")
+                async with httpx.AsyncClient(timeout=180, follow_redirects=True) as client:
+                    response = await client.get(result_url, headers={"User-Agent": "biche-storyboard/1.0"})
+                try:
+                    response.raise_for_status()
+                except httpx.HTTPError as exc:
+                    raise XYQNestProviderError(
+                        f"XYQ result download failed: status={response.status_code}, url={result_url}"
+                    ) from exc
+                mime_type = response.headers.get("content-type", "video/mp4").split(";")[0]
+                if not mime_type.startswith("video/") and not _looks_like_video_url(result_url):
+                    raise XYQNestProviderError(f"XYQ result is not a video asset: {result_url}")
+                return {
+                    "status": "succeeded",
+                    "provider_task_id": provider_task_id,
+                    "video_bytes": response.content,
+                    "mime_type": mime_type,
+                    "provider_response": {
+                        "run": run,
+                        "result_url": result_url,
+                        "web_thread_link": task_ref.web_thread_link,
+                    },
+                }
+
+            if run_state == 4:
+                raise XYQNestProviderError(str(run.get("fail_reason") or "XYQ task failed"))
+            if run_state == 5:
+                raise XYQNestProviderError("XYQ task was cancelled")
+            if attempt < attempts - 1:
+                await asyncio.sleep(interval)
+
+        detail = f"：{last_message}" if last_message else ""
+        raise XYQNestProviderError(f"XYQ task timed out{detail}")
+
+
+async def _upload_assets_from_payload(payload: dict, access_key: str) -> list[_UploadedAsset]:
+    ordered_sources: list[tuple[str, str]] = []
+    if payload.get("first_frame_url"):
+        ordered_sources.append(("首帧参考", str(payload["first_frame_url"])))
+    if payload.get("last_frame_url"):
+        ordered_sources.append(("尾帧参考", str(payload["last_frame_url"])))
+    if payload.get("reference_image_url"):
+        ordered_sources.append(("参考图", str(payload["reference_image_url"])))
+    for index, url in enumerate(payload.get("keyframe_urls") or [], start=1):
+        if url:
+            ordered_sources.append((f"关键帧参考{index}", str(url)))
+
+    uploaded: list[_UploadedAsset] = []
+    seen: set[str] = set()
+    for label, source_url in ordered_sources:
+        if source_url in seen:
+            continue
+        seen.add(source_url)
+        filename, content, mime_type = await _materialize_file(source_url)
+        asset_id = await _upload_file(
+            access_key=access_key,
+            filename=filename,
+            content=content,
+            mime_type=mime_type,
+        )
+        uploaded.append(_UploadedAsset(label=label, asset_id=asset_id))
+    return uploaded
+
+
+async def _materialize_file(source_url: str) -> tuple[str, bytes, str]:
+    if source_url.startswith("file://"):
+        path = Path(source_url.replace("file://", ""))
+        if not path.exists():
+            raise XYQNestProviderError(f"XYQ source file does not exist: {path}")
+        mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
+        return path.name, path.read_bytes(), mime_type
+
+    async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+        response = await client.get(source_url, headers={"User-Agent": "biche-storyboard/1.0"})
+    try:
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise XYQNestProviderError(f"failed to fetch reference asset: {source_url}") from exc
+
+    parsed = urlparse(source_url)
+    filename = Path(parsed.path).name or "reference"
+    mime_type = response.headers.get("content-type", "").split(";")[0] or mimetypes.guess_type(filename)[0] or "application/octet-stream"
+    if "." not in filename:
+        suffix = mimetypes.guess_extension(mime_type) or ".bin"
+        filename = f"{filename}{suffix}"
+    return filename, response.content, mime_type
+
+
+async def _upload_file(*, access_key: str, filename: str, content: bytes, mime_type: str) -> str:
+    async with httpx.AsyncClient(timeout=180) as client:
+        response = await client.post(
+            f"{settings.xyq_base_url.rstrip('/')}{UPLOAD_FILE_PATH}",
+            headers={"Authorization": f"Bearer {access_key}"},
+            data={"accessKey": access_key},
+            files={"file": (filename, content, mime_type)},
+        )
+    data = _decode_response(response)
+    asset_id = str(data.get("pippit_asset_id") or data.get("asset_id") or "").strip()
+    if not asset_id:
+        raise XYQNestProviderError("XYQ upload_file did not return asset_id")
+    return asset_id
+
+
+async def _api_post(*, path: str, access_key: str, body: dict, timeout: float) -> dict:
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        response = await client.post(
+            f"{settings.xyq_base_url.rstrip('/')}{path}",
+            headers={
+                "Authorization": f"Bearer {access_key}",
+                "Content-Type": "application/json",
+            },
+            json=body,
+        )
+    return _decode_response(response)
+
+
+def _decode_response(response: httpx.Response) -> dict:
+    try:
+        payload = response.json()
+    except ValueError as exc:
+        raise XYQNestProviderError(f"XYQ returned non-JSON response: {response.text[:300]}") from exc
+    try:
+        response.raise_for_status()
+    except httpx.HTTPError as exc:
+        raise XYQNestProviderError(
+            f"XYQ HTTP error: status={response.status_code}, body={json.dumps(payload, ensure_ascii=False)[:300]}"
+        ) from exc
+    if str(payload.get("ret")) != "0":
+        raise XYQNestProviderError(f"XYQ API error: ret={payload.get('ret')}, errmsg={payload.get('errmsg')}")
+    return payload.get("data") or {}
+
+
+def _build_video_message(payload: dict, uploaded_assets: list[_UploadedAsset]) -> str:
+    prompt = str(payload.get("prompt") or "").strip()
+    if not prompt:
+        raise XYQNestProviderError("XYQ video prompt is required")
+    lines = [
+        "请直接生成 1 条分镜视频，不要反问，不要要求我补充信息，也不要输出多套方案。",
+        "如有附件，请将其视为我已经确认好的参考素材，并直接完成创作。",
+        f"画面描述：{prompt}",
+    ]
+    camera_motion = str(payload.get("camera_motion") or "").strip()
+    negative_prompt = str(payload.get("negative_prompt") or "").strip()
+    duration_seconds = payload.get("duration_seconds")
+    model = str(payload.get("model") or payload.get("model_id") or settings.xyq_video_model).strip()
+    if camera_motion:
+        lines.append(f"镜头运动：{camera_motion}")
+    if negative_prompt:
+        lines.append(f"避免出现：{negative_prompt}")
+    if duration_seconds:
+        lines.append(f"目标时长：{int(duration_seconds)} 秒")
+    if model:
+        lines.append(f"任务标记：{model}")
+    if uploaded_assets:
+        lines.append("附件说明：")
+        for index, asset in enumerate(uploaded_assets, start=1):
+            lines.append(f"{index}. {asset.label}")
+        lines.append("如果同时存在首帧和尾帧，请将首帧作为起点、尾帧作为终点，生成自然连贯的镜头过渡。")
+        lines.append("其他附件用于主体、风格、服装、场景和光线一致性参考。")
+    lines.append("输出要求：直接产出最终视频，保持角色、服装、光线和空间关系稳定。")
+    return "\n".join(lines)
+
+
+def _encode_task_ref(task_ref: _TaskRef) -> str:
+    compact = json.dumps(
+        {
+            "thread_id": task_ref.thread_id,
+            "run_id": task_ref.run_id,
+            **({"web_thread_link": task_ref.web_thread_link} if task_ref.web_thread_link else {}),
+        },
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    if len(compact) <= 255:
+        return compact
+    return json.dumps({"thread_id": task_ref.thread_id, "run_id": task_ref.run_id}, separators=(",", ":"))
+
+
+def _decode_task_ref(provider_task_id: str) -> _TaskRef:
+    raw = str(provider_task_id or "").strip()
+    if not raw:
+        raise XYQNestProviderError("XYQ provider_task_id is empty")
+    if raw.startswith("{"):
+        parsed = json.loads(raw)
+        thread_id = str(parsed.get("thread_id") or "").strip()
+        run_id = str(parsed.get("run_id") or "").strip()
+        if not thread_id or not run_id:
+            raise XYQNestProviderError("XYQ provider_task_id is invalid")
+        return _TaskRef(
+            thread_id=thread_id,
+            run_id=run_id,
+            web_thread_link=str(parsed.get("web_thread_link") or "").strip() or None,
+        )
+    if "|" in raw:
+        thread_id, run_id = raw.split("|", 1)
+        if thread_id and run_id:
+            return _TaskRef(thread_id=thread_id, run_id=run_id)
+    raise XYQNestProviderError("XYQ provider_task_id format is not supported")
+
+
+def _extract_result_url(run: dict) -> str | None:
+    candidates = _collect_media_urls(run)
+    for url, is_video in candidates:
+        if is_video:
+            return url
+    return candidates[0][0] if candidates else None
+
+
+def _collect_media_urls(value, *, video_hint: bool = False) -> list[tuple[str, bool]]:
+    candidates: list[tuple[str, bool]] = []
+    if isinstance(value, dict):
+        current_hint = video_hint or _mapping_looks_like_video(value)
+        url = value.get("url")
+        if isinstance(url, str) and url.startswith(("http://", "https://")):
+            candidates.append((url, current_hint or _looks_like_video_url(url)))
+        for child in value.values():
+            candidates.extend(_collect_media_urls(child, video_hint=current_hint))
+    elif isinstance(value, list):
+        for child in value:
+            candidates.extend(_collect_media_urls(child, video_hint=video_hint))
+    deduped: list[tuple[str, bool]] = []
+    seen: dict[str, bool] = {}
+    for url, is_video in candidates:
+        seen[url] = seen.get(url, False) or is_video
+    for url, is_video in seen.items():
+        deduped.append((url, is_video))
+    return deduped
+
+
+def _mapping_looks_like_video(value: dict) -> bool:
+    keys = ("type", "subtype", "mime_type", "content_type", "media_type", "file_type", "name")
+    joined = " ".join(str(value.get(key) or "") for key in keys).lower()
+    return "video" in joined or any(suffix in joined for suffix in VIDEO_SUFFIXES)
+
+
+def _extract_text_summary(run: dict) -> str:
+    parts = _collect_text_fragments(run)
+    for part in parts:
+        if "http" not in part:
+            return part
+    return ""
+
+
+def _collect_text_fragments(value) -> list[str]:
+    fragments: list[str] = []
+    if isinstance(value, str):
+        stripped = value.strip()
+        if stripped:
+            fragments.append(stripped)
+    elif isinstance(value, list):
+        for child in value:
+            fragments.extend(_collect_text_fragments(child))
+    elif isinstance(value, dict):
+        for key in ("text", "title", "content", "message", "description", "desc", "question", "prompt"):
+            if key in value:
+                fragments.extend(_collect_text_fragments(value.get(key)))
+    return fragments
+
+
+def _looks_like_video_url(url: str) -> bool:
+    path = urlparse(url).path.lower()
+    return path.endswith(VIDEO_SUFFIXES)
+
+
+def _normalize_run_state(value) -> int | None:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _require_access_key() -> str:
+    if not settings.xyq_access_key:
+        raise XYQNestProviderError("XYQ_ACCESS_KEY is required")
+    return settings.xyq_access_key

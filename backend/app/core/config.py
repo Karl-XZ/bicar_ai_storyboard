@@ -38,6 +38,19 @@ class Settings(BaseSettings):
     openai_text_model: str = "gpt-5.4"
     openai_image_model: str = "gpt-image-2"
 
+    deepseek_api_key: str = ""
+    deepseek_base_url: str = "https://api.deepseek.com"
+    deepseek_anthropic_base_url: str = "https://api.deepseek.com/anthropic"
+    deepseek_text_model: str = "deepseek-v4-pro"
+    deepseek_fast_text_model: str = "deepseek-v4-flash"
+
+    openrouter_api_key: str = ""
+    openrouter_base_url: str = "https://openrouter.ai/api/v1"
+    openrouter_text_model: str = "google/gemini-3.1-pro-preview"
+    openrouter_fast_text_model: str = "google/gemini-3.1-flash-lite-preview"
+    openrouter_image_model: str = "openai/gpt-5.4-image-2"
+    openrouter_nano_banana_model: str = "google/gemini-3.1-flash-image-preview"
+
     dashscope_api_key: str = ""
     dashscope_base_url: str = "https://dashscope.aliyuncs.com/api/v1"
     dashscope_compatible_base_url: str = "https://dashscope.aliyuncs.com/compatible-mode/v1"
@@ -63,6 +76,11 @@ class Settings(BaseSettings):
     seedance_model_id: str = ""
     seedance_webhook_secret: str = ""
 
+    xyq_access_key: str = ""
+    xyq_base_url: str = "https://xyq.jianying.com"
+    xyq_video_model: str = "xyq_nest_video"
+
+    chatbot_memory_rounds: int = Field(default=20, ge=0)
     image_parallel_per_project: int = Field(default=10, ge=1)
     video_parallel_per_project: int = Field(default=2, ge=1)
     image_max_retries: int = Field(default=3, ge=0)

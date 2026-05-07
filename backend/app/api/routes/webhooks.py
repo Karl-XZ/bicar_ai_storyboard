@@ -26,10 +26,19 @@ async def feishu_events(request: Request, db: Session = Depends(get_db)):
         raise HTTPException(status_code=401, detail="invalid Feishu verification token")
     event_type = event.get("header", {}).get("event_type") or event.get("type")
     if event_type == "im.message.receive_v1":
-        message = event.get("event", {}).get("message", {})
+        event_data = event.get("event", {})
+        message = event_data.get("message", {})
+        sender = event_data.get("sender", {}) or {}
+        sender_id = sender.get("sender_id", {}) or {}
         text = _message_text(message)
         chat_id = message.get("chat_id") or settings.feishu_default_chat_id
-        result = await handle_bot_text(db, text=text, chat_id=chat_id)
+        result = await handle_bot_text(
+            db,
+            text=text,
+            chat_id=chat_id,
+            chat_type=message.get("chat_type"),
+            sender_open_id=sender_id.get("open_id"),
+        )
         if result:
             return ApiResponse(
                 request_id=request.headers.get("x-request-id", f"req_{uuid4().hex}"),

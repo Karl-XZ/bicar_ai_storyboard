@@ -7,6 +7,7 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .venv/
+backend/.venv311/
 
 # Node
 node_modules/

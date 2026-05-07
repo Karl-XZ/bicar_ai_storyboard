@@ -55,7 +55,7 @@ def help_card() -> dict:
             "- `/生成全部图片和视频`：连续执行图片和视频生成",
             "- `/启动首尾帧同步`：把所有行的 `首帧同步设置` 改为 `是`",
             "- `/启动关键帧生成`：后续生成图片时同时生成关键帧候选图",
-            "- `/切换chatbot模型 qwen-plus`：切换普通对话模型，可选 qwen-plus / qwen-max / gpt-5.4",
+            "- `/切换chatbot模型 qwen-plus`：切换普通对话模型，可选 qwen-plus / qwen-max / gpt-5.4 / deepseek-v4-pro / deepseek-v4-flash / google/gemini-3.1-pro-preview / google/gemini-3.1-flash-lite-preview",
             "- `/同步表格`：补齐默认值并同步分镜行",
             "- `/查看进度`：查看最近项目进度",
             "",

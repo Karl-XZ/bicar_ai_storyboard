@@ -129,7 +129,17 @@ def bitable_field_definitions() -> list[dict]:
         elif field.name == "满意度":
             item["property"] = {"options": [{"name": "满意"}, {"name": "不满意"}]}
         elif field.name == "文本模型":
-            item["property"] = {"options": [{"name": "qwen-plus"}, {"name": "qwen-max"}, {"name": "gpt-5.4"}]}
+            item["property"] = {
+                "options": [
+                    {"name": "qwen-plus"},
+                    {"name": "qwen-max"},
+                    {"name": "gpt-5.4"},
+                    {"name": "deepseek-v4-pro"},
+                    {"name": "deepseek-v4-flash"},
+                    {"name": "google/gemini-3.1-pro-preview"},
+                    {"name": "google/gemini-3.1-flash-lite-preview"},
+                ]
+            }
         elif field.name == "图片模型":
             item["property"] = {
                 "options": [
@@ -137,6 +147,8 @@ def bitable_field_definitions() -> list[dict]:
                     {"name": "wanx-v1"},
                     {"name": "nano_banana_2"},
                     {"name": "gpt_image_2"},
+                    {"name": "openai/gpt-5.4-image-2"},
+                    {"name": "google/gemini-3.1-flash-image-preview"},
                 ]
             }
         elif field.name == "视频模型":
@@ -146,6 +158,7 @@ def bitable_field_definitions() -> list[dict]:
                     {"name": "wanx2.1-kf2v-plus"},
                     {"name": "wanx2.1-i2v-turbo"},
                     {"name": "seedance_2_0"},
+                    {"name": "xyq_nest_video"},
                 ]
             }
         fields.append(item)
