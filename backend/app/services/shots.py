@@ -54,6 +54,10 @@ class ShotService:
             "selected_keyframe_tokens": self._attachment_tokens(fields.get("选中关键帧图")),
             "reference_tokens": self._attachment_tokens(fields.get("参考图")),
             "reference_image_urls": self._attachment_urls(fields.get("参考图")),
+            "transition_alignment": self._single_select(fields.get("首帧同步设置")) or "否",
+            "regeneration_options": self._multi_select(fields.get("需要重新生成的选项")),
+            "regeneration_status": self._single_select(fields.get("重新生成状态")) or GENERATION_STATUS_NOT_STARTED,
+            "video_storage_url": self._plain(fields.get("视频存储位置")),
         }
         status_text = self._single_select(fields.get("审核状态")) or "草稿"
         image_generation_status = self._single_select(fields.get("图片生成状态")) or GENERATION_STATUS_NOT_STARTED
@@ -107,6 +111,21 @@ class ShotService:
         if isinstance(value, dict):
             return value.get("text") or value.get("name") or ""
         return ""
+
+    def _multi_select(self, value) -> list[str]:
+        if isinstance(value, str):
+            return [value] if value else []
+        if not isinstance(value, list):
+            return []
+        values = []
+        for item in value:
+            if isinstance(item, str):
+                values.append(item)
+            elif isinstance(item, dict):
+                selected = item.get("text") or item.get("name")
+                if selected:
+                    values.append(str(selected))
+        return values
 
     def _number(self, value) -> int | None:
         if value in (None, ""):

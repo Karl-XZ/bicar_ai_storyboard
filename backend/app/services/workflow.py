@@ -59,6 +59,40 @@ class WorkflowService:
         self.db.commit()
         return job
 
+    async def revise_prompts_async(self, shot_id: UUID, *, prompt_keys: list[str], rejection_reason: str) -> Shot:
+        shot = self._require_shot(shot_id)
+        if not prompt_keys:
+            return shot
+        provider, model_id = self._provider_model(shot, "text")
+        provider_instance = self.provider_router.text(provider)
+        result = await provider_instance.optimize_prompt(
+            {
+                "scene_description": shot.scene_description,
+                "existing_prompts": shot.prompts or {},
+                "revision_instruction": rejection_reason,
+                "selected_prompt_fields": prompt_keys,
+                "project_style": "cinematic realistic",
+                "model": model_id,
+            }
+        )
+        generated = {
+            "keyframe_prompt": result.keyframe_prompt,
+            "first_frame_prompt": result.first_frame_prompt,
+            "last_frame_prompt": result.last_frame_prompt,
+            "video_prompt": result.video_prompt,
+            "negative_prompt": result.negative_prompt,
+            "camera_motion": result.camera_motion,
+            "consistency_notes": result.consistency_notes,
+            "style_tags": result.style_tags,
+        }
+        current = shot.prompts or {}
+        selected = {key: generated[key] for key in prompt_keys if key in generated}
+        shot.prompts = {**current, **selected}
+        shot.prompt_version += 1
+        shot.status = ShotStatus.PENDING_FRAMES.value
+        self.db.commit()
+        return shot
+
     def generate_frames(
         self,
         shot_id: UUID,

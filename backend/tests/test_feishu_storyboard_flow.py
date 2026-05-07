@@ -18,8 +18,10 @@ class FakeFeishuClient:
                     "场景描述": "清晨厨房，一杯咖啡在木桌上",
                 "生成批次": "batch_001",
                 "审核状态": "待优化",
+                "首帧同步设置": "否",
                 "图片生成状态": "未开始",
                 "生成状态": "未开始",
+                "重新生成状态": "未开始",
                 "Prompt 版本": 1,
             },
         }
@@ -51,8 +53,10 @@ class FakeFeishuClient:
             "场景描述",
             "生成批次",
             "审核状态",
+            "首帧同步设置",
             "图片生成状态",
             "生成状态",
+            "重新生成状态",
             "Prompt 版本",
         ]
         return {"code": 0, "data": {"items": [{"field_name": name, "field_id": f"fld_{index}"} for index, name in enumerate(names)]}}
@@ -120,8 +124,10 @@ def test_feishu_storyboard_real_user_flow(monkeypatch):
         assert fake.records[1]["fields"]["镜号"] == "001"
         assert fake.records[1]["fields"]["生成批次"] == "batch_001"
         assert fake.records[1]["fields"]["审核状态"] == "草稿"
+        assert fake.records[1]["fields"]["首帧同步设置"] == "否"
         assert fake.records[1]["fields"]["图片生成状态"] == "未开始"
         assert fake.records[1]["fields"]["生成状态"] == "未开始"
+        assert fake.records[1]["fields"]["重新生成状态"] == "未开始"
 
         optimized = await service.optimize_current_batch(project=provisioned.project, batch_no="batch_001")
         assert optimized[0].status == ShotStatus.PENDING_FRAMES.value
@@ -148,13 +154,13 @@ def test_feishu_storyboard_real_user_flow(monkeypatch):
         assert shot.status == ShotStatus.PENDING_ACCEPTANCE.value
         assert fake.records[0]["fields"]["审核状态"] == "通过"
         assert fake.records[0]["fields"]["生成状态"] == "生成完成"
-        assert fake.records[0]["fields"]["视频链接"]["link"].startswith("https://feishu.test/drive/file/")
+        assert fake.records[0]["fields"]["视频链接"]["link"].startswith("https://feishu.test/file/")
 
         fake.records[0]["fields"]["满意度"] = "满意"
         shot = await service.process_record_status(project=provisioned.project, record=fake.records[0])
         assert shot.status == ShotStatus.ARCHIVED_SATISFIED.value
         assert fake.records[0]["fields"]["审核状态"] == "通过"
-        assert fake.records[0]["fields"]["归档链接"]["link"].startswith("https://feishu.test/drive/file/")
+        assert fake.records[0]["fields"]["归档链接"]["link"].startswith("https://feishu.test/file/")
 
         project = ProjectService(db).get_project(provisioned.project.id)
         stats = service.progress_stats(project)

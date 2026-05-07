@@ -27,6 +27,14 @@ from app.services.shots import (
 )
 from app.services.workflow import WorkflowError, WorkflowService
 
+REGENERATE_OPTION_TO_PROMPT = {
+    "关键帧提示词": "keyframe_prompt",
+    "首帧提示词": "first_frame_prompt",
+    "尾帧提示词": "last_frame_prompt",
+    "视频提示词": "video_prompt",
+}
+REGENERATE_IMAGE_OPTIONS = {"关键帧重新生成", "首帧重新生成", "尾帧重新生成"}
+
 
 @dataclass(frozen=True)
 class ProvisionedProject:
@@ -149,6 +157,13 @@ class FeishuStoryboardService:
         config = {**(project.workflow_config or {}), "transition_alignment_enabled": True}
         project.workflow_config = config
         self.db.commit()
+        await self.sync_from_feishu(project)
+        shots = self.projects.list_shots(project.id)
+        for shot in shots:
+            self._set_prompt_value(shot, "transition_alignment", "是")
+        self.db.commit()
+        if shots:
+            await self.backfill_shots(project, shots)
         return await self.sync_tail_to_next_first_frame(project)
 
     async def sync_tail_to_next_first_frame(self, project: Project) -> int:
@@ -239,12 +254,15 @@ class FeishuStoryboardService:
         *,
         force: bool = False,
         only_started: bool = False,
+        include_first_frame: bool | None = None,
+        include_last_frame: bool | None = None,
+        include_keyframes: bool | None = None,
     ) -> list[Shot]:
         workflow = WorkflowService(self.db)
         generated: list[Shot] = []
-        transition_enabled = bool((project.workflow_config or {}).get("transition_alignment_enabled"))
         keyframes_enabled = bool((project.workflow_config or {}).get("keyframe_generation_enabled"))
-        ordered_shots = self.projects.list_shots(project.id) if transition_enabled else shots
+        keyframes_enabled = keyframes_enabled if include_keyframes is None else include_keyframes
+        ordered_shots = self.projects.list_shots(project.id)
         previous_by_id = {current.id: previous for previous, current in zip(ordered_shots, ordered_shots[1:])}
         for index, shot in enumerate(shots):
             image_status = (shot.prompts or {}).get("image_generation_status") or GENERATION_STATUS_NOT_STARTED
@@ -266,15 +284,16 @@ class FeishuStoryboardService:
                     self.db.refresh(shot)
                     self._set_prompt_value(shot, "review_status", "待生成帧")
                     await self.backfill_shots(project, [shot])
-                include_first = True
+                include_first = True if include_first_frame is None else include_first_frame
+                include_last = True if include_last_frame is None else include_last_frame
                 previous = previous_by_id.get(shot.id)
-                if transition_enabled and previous:
+                if include_first and self._transition_sync_enabled(shot) and previous:
                     synced = await self._sync_tail_to_first_frame(project, previous, shot)
                     include_first = not bool(synced)
                 await workflow.generate_frames_async(
                     shot.id,
                     include_first_frame=include_first,
-                    include_last_frame=True,
+                    include_last_frame=include_last,
                     include_keyframes=keyframes_enabled,
                     force=force,
                 )
@@ -319,8 +338,10 @@ class FeishuStoryboardService:
                 "图片模型": (shot.prompts or {}).get("image_model") or self._project_model(project, "image"),
                 "视频模型": (shot.prompts or {}).get("video_model") or self._project_model(project, "video"),
                 "审核状态": self._review_status_for_shot(shot),
+                "首帧同步设置": self._transition_alignment_for_shot(shot),
                 "图片生成状态": self._image_generation_status_for_shot(shot),
                 "生成状态": self._generation_status_for_shot(shot),
+                "重新生成状态": self._regeneration_status_for_shot(shot),
                 "Prompt 版本": shot.prompt_version,
                 "错误信息": shot.error_message or "",
             }
@@ -418,6 +439,7 @@ class FeishuStoryboardService:
             for shot in shots
             if shot.error_code or shot.error_message
         ]
+        transition_state = self._transition_alignment_state(shots)
         return {
             "total": len(shots),
             "prompt_optimized": prompt_optimized,
@@ -432,7 +454,8 @@ class FeishuStoryboardService:
             "errors": len(error_items),
             "error_items": error_items[:5],
             "log_paths": self._log_paths(),
-            "transition_alignment_enabled": bool((project.workflow_config or {}).get("transition_alignment_enabled")),
+            "transition_alignment_enabled": transition_state == "已启动",
+            "transition_alignment_state": transition_state,
             "keyframe_generation_enabled": bool((project.workflow_config or {}).get("keyframe_generation_enabled")),
             "pending_frames": sum(1 for shot in shots if shot.status == ShotStatus.PENDING_FRAMES.value),
             "frames_generating": image_generating,
@@ -463,6 +486,11 @@ class FeishuStoryboardService:
             await self.generate_shot_video(project, shot, force=True)
             self.db.refresh(shot)
 
+        regeneration_status = self._field_text((record.get("fields") or {}).get("重新生成状态"))
+        if regeneration_status == GENERATION_STATUS_STARTED:
+            await self.regenerate_shot_from_rejection(project, shot)
+            self.db.refresh(shot)
+
         satisfaction_text = self._field_text((record.get("fields") or {}).get("满意度"))
         if satisfaction_text == "满意":
             workflow.archive_shot(shot.id, Satisfaction.SATISFIED)
@@ -477,6 +505,65 @@ class FeishuStoryboardService:
         else:
             self.db.commit()
         return shot
+
+    async def regenerate_shot_from_rejection(self, project: Project, shot: Shot) -> bool:
+        workflow = WorkflowService(self.db)
+        options = set((shot.prompts or {}).get("regeneration_options") or [])
+        rejection_reason = shot.error_message or (shot.prompts or {}).get("rejection_reason") or ""
+        if not options:
+            self._set_prompt_value(shot, "regeneration_status", GENERATION_STATUS_NOT_STARTED)
+            shot.error_code = "REGENERATION_OPTIONS_REQUIRED"
+            shot.error_message = "请先在「需要重新生成的选项」里选择要重做的内容"
+            self.db.commit()
+            await self.backfill_shots(project, [shot])
+            return False
+        self._set_prompt_value(shot, "regeneration_status", GENERATION_STATUS_GENERATING)
+        shot.error_code = None
+        shot.error_message = None
+        self.db.commit()
+        await self.backfill_shots(project, [shot])
+        try:
+            prompt_keys = [key for option, key in REGENERATE_OPTION_TO_PROMPT.items() if option in options]
+            if prompt_keys:
+                await workflow.revise_prompts_async(shot.id, prompt_keys=prompt_keys, rejection_reason=rejection_reason)
+                self.db.refresh(shot)
+
+            image_options = options & REGENERATE_IMAGE_OPTIONS
+            if image_options:
+                await self._generate_images_for_shots(
+                    project,
+                    [shot],
+                    force=True,
+                    include_first_frame="首帧重新生成" in image_options,
+                    include_last_frame="尾帧重新生成" in image_options,
+                    include_keyframes="关键帧重新生成" in image_options,
+                )
+                self.db.refresh(shot)
+
+            if "视频重新生成" in options:
+                await self.generate_shot_video(project, shot, force=True)
+                self.db.refresh(shot)
+
+            self._set_prompt_value(shot, "regeneration_status", GENERATION_STATUS_DONE)
+            shot.error_code = None
+            shot.error_message = None
+            self.db.commit()
+            await self.backfill_shots(project, [shot])
+            return True
+        except WorkflowError as exc:
+            self._set_prompt_value(shot, "regeneration_status", GENERATION_STATUS_NOT_STARTED)
+            shot.error_code = exc.code
+            shot.error_message = exc.message
+            self.db.commit()
+            await self.backfill_shots(project, [shot])
+            return False
+        except Exception as exc:
+            self._set_prompt_value(shot, "regeneration_status", GENERATION_STATUS_NOT_STARTED)
+            shot.error_code = type(exc).__name__
+            shot.error_message = str(exc)
+            self.db.commit()
+            await self.backfill_shots(project, [shot])
+            return False
 
     async def _provision_feishu_resources(self, project: Project) -> dict:
         project_folder = await self.feishu.create_folder(settings.feishu_root_folder_token or "root", project.name)
@@ -526,7 +613,7 @@ class FeishuStoryboardService:
             "首帧图": (AssetType.FIRST_FRAME, folders.get("frames")),
             "尾帧图": (AssetType.LAST_FRAME, folders.get("frames")),
             "关键帧图": (AssetType.KEYFRAME, folders.get("frames")),
-            "视频链接": (AssetType.VIDEO, folders.get("videos")),
+            "视频链接": (AssetType.VIDEO, self._video_folder_for_shot(shot, folders)),
             "归档链接": (AssetType.ARCHIVE, self._archive_folder_for_status(shot, folders)),
         }
         for field_name, (asset_type, folder_token) in mapping.items():
@@ -558,7 +645,7 @@ class FeishuStoryboardService:
                     fields["选中关键帧图"] = [file_tokens[0]]
 
     async def _upload_drive_asset(self, asset: Asset, folder_token: str) -> str | None:
-        if asset.feishu_drive_token:
+        if asset.feishu_drive_token and asset.feishu_drive_folder_token == folder_token:
             return asset.feishu_drive_token
         path = Path(asset.storage_uri.replace("file://", ""))
         if not path.exists():
@@ -567,6 +654,7 @@ class FeishuStoryboardService:
         token = self._extract_file_token(response)
         if token:
             asset.feishu_drive_token = token
+            asset.feishu_drive_folder_token = folder_token
             self.db.flush()
         return token
 
@@ -624,8 +712,10 @@ class FeishuStoryboardService:
         fields = {
             "生成批次": "batch_001",
             "审核状态": "草稿",
+            "首帧同步设置": "否",
             "图片生成状态": GENERATION_STATUS_NOT_STARTED,
             "生成状态": GENERATION_STATUS_NOT_STARTED,
+            "重新生成状态": GENERATION_STATUS_NOT_STARTED,
             "Prompt 版本": 1,
             "文本模型": self._project_model(project, "text"),
             "图片模型": self._project_model(project, "image"),
@@ -684,6 +774,16 @@ class FeishuStoryboardService:
             return str(image_generation_status)
         return GENERATION_STATUS_NOT_STARTED
 
+    def _regeneration_status_for_shot(self, shot: Shot) -> str:
+        return str((shot.prompts or {}).get("regeneration_status") or GENERATION_STATUS_NOT_STARTED)
+
+    def _transition_alignment_for_shot(self, shot: Shot) -> str:
+        value = (shot.prompts or {}).get("transition_alignment")
+        return "是" if value == "是" else "否"
+
+    def _transition_sync_enabled(self, shot: Shot) -> bool:
+        return self._transition_alignment_for_shot(shot) == "是"
+
     def _set_prompt_value(self, shot: Shot, key: str, value) -> None:
         shot.prompts = {**(shot.prompts or {}), key: value}
         self.db.flush()
@@ -716,7 +816,7 @@ class FeishuStoryboardService:
         return f"https://{domain}/drive/folder/{token}"
 
     def _drive_file_url(self, project: Project, token: str) -> str:
-        return f"{self._project_site_url(project)}/drive/file/{token}"
+        return f"{self._project_site_url(project)}/file/{token}"
 
     def _project_site_url(self, project: Project) -> str:
         for key in ("table_url", "folder_url"):
@@ -743,13 +843,39 @@ class FeishuStoryboardService:
         if isinstance(value, str):
             return value.strip()
         if isinstance(value, dict):
-            return str(value.get("text") or value.get("name") or "").strip()
+            return str(value.get("text") or value.get("name") or value.get("link") or "").strip()
         if isinstance(value, list):
             return "".join(self._field_text(item) for item in value).strip()
         return str(value).strip()
 
     def _project_model(self, project: Project, kind: str) -> str:
         return str(((project.model_config or {}).get(kind) or {}).get("model_id") or "")
+
+    def _transition_alignment_state(self, shots: list[Shot]) -> str:
+        if not shots:
+            return "未启动"
+        values = {self._transition_alignment_for_shot(shot) for shot in shots}
+        if values == {"是"}:
+            return "已启动"
+        if values == {"否"}:
+            return "未启动"
+        return "自定义"
+
+    def _video_folder_for_shot(self, shot: Shot, folders: dict) -> str | None:
+        custom_url = (shot.prompts or {}).get("video_storage_url")
+        token = self._folder_token_from_url(custom_url)
+        return token or folders.get("videos")
+
+    def _folder_token_from_url(self, url: str | None) -> str | None:
+        if not url:
+            return None
+        parsed = urlparse(str(url))
+        parts = [part for part in parsed.path.split("/") if part]
+        try:
+            index = parts.index("folder")
+            return parts[index + 1] if len(parts) > index + 1 else None
+        except ValueError:
+            return None
 
     def _log_paths(self) -> list[str]:
         backend_root = Path(__file__).resolve().parents[2]

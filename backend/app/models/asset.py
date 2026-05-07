@@ -14,6 +14,7 @@ class Asset(UUIDMixin, TimestampMixin, Base):
     public_url: Mapped[str | None] = mapped_column(String(2048))
     feishu_file_token: Mapped[str | None] = mapped_column(String(255))
     feishu_drive_token: Mapped[str | None] = mapped_column(String(255))
+    feishu_drive_folder_token: Mapped[str | None] = mapped_column(String(255))
     provider: Mapped[str | None] = mapped_column(String(128))
     model_id: Mapped[str | None] = mapped_column(String(255))
     prompt_hash: Mapped[str | None] = mapped_column(String(128), index=True)

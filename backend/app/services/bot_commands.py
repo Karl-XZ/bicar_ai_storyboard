@@ -3,6 +3,7 @@ from __future__ import annotations
 import re
 from typing import Any
 
+import httpx
 from sqlalchemy.orm import Session
 
 from app.adapters.feishu import FeishuClient
@@ -15,12 +16,29 @@ from app.services.projects import ProjectService
 async def handle_bot_text(db: Session, *, text: str, chat_id: str | None = None) -> dict[str, Any] | None:
     target_chat = chat_id or settings.feishu_default_chat_id
     feishu = FeishuClient()
-    if _is_help_command(text):
+    if not _is_slash_command(text):
+        reply = await _chatbot_reply(db, text=text, chat_id=target_chat)
+        if target_chat and reply:
+            await feishu.send_text(target_chat, reply)
+        return {"message": "chatbot 已回复", "data": {"chat_id": target_chat}}
+
+    command_text = _command_text(text)
+    if _is_help_command(command_text):
         if target_chat:
             await feishu.send_card(target_chat, help_card())
         return {"message": "帮助已发送", "data": {"chat_id": target_chat}}
 
-    project_name = _parse_create_project_command(text)
+    switch_model = _parse_chatbot_model_command(command_text)
+    if switch_model:
+        project = ProjectService(db).latest_for_chat(target_chat)
+        if project:
+            project.workflow_config = {**(project.workflow_config or {}), "chatbot_text_model": switch_model}
+            db.commit()
+        if target_chat:
+            await feishu.send_text(target_chat, f"chatbot 文本模型已切换为：{switch_model}")
+        return {"message": "chatbot 模型已切换", "data": {"model": switch_model}}
+
+    project_name = _parse_create_project_command(command_text)
     if project_name:
         provisioned = await FeishuStoryboardService(db).create_project_from_bot(project_name=project_name, chat_id=target_chat)
         return {
@@ -28,7 +46,7 @@ async def handle_bot_text(db: Session, *, text: str, chat_id: str | None = None)
             "data": {"project_id": str(provisioned.project.id), "table_url": provisioned.table_url},
         }
 
-    command = _parse_project_command(text)
+    command = _parse_project_command(command_text)
     if command:
         project = ProjectService(db).latest_for_chat(target_chat)
         if not project:
@@ -127,7 +145,24 @@ def _parse_create_project_command(text: str) -> str | None:
 
 def _is_help_command(text: str) -> bool:
     normalized = text.strip().lower()
-    return normalized in {"帮助", "help", "/help", "菜单", "命令", "指令", "使用说明", "说明"}
+    return normalized in {"帮助", "help", "菜单", "命令", "指令", "使用说明", "说明"}
+
+
+def _is_slash_command(text: str) -> bool:
+    return text.strip().startswith("/")
+
+
+def _command_text(text: str) -> str:
+    return text.strip()[1:].strip() if _is_slash_command(text) else text.strip()
+
+
+def _parse_chatbot_model_command(text: str) -> str | None:
+    normalized = re.sub(r"\s+", " ", text.strip())
+    match = re.match(r"^(?:切换chatbot模型|切换聊天模型|切换文本模型|chatbot模型)\s+(\S+)$", normalized, flags=re.IGNORECASE)
+    if not match:
+        return None
+    model = match.group(1)
+    return model if model in {"qwen-plus", "qwen-max", "gpt-5.4"} else None
 
 
 def _parse_project_command(text: str) -> dict[str, str] | None:
@@ -158,3 +193,58 @@ def _extract_batch_no(text: str) -> str | None:
     if not match:
         return None
     return match.group(0).lower().replace("-", "_")
+
+
+async def _chatbot_reply(db: Session, *, text: str, chat_id: str | None) -> str:
+    project = ProjectService(db).latest_for_chat(chat_id)
+    model = str(((project.workflow_config or {}).get("chatbot_text_model") if project else None) or settings.dashscope_text_model)
+    if model.startswith("qwen") and settings.dashscope_api_key:
+        return await _dashscope_chat(model=model, text=text)
+    if model.startswith("gpt") and settings.openai_api_key:
+        return await _openai_chat(model=model, text=text)
+    return f"我可以正常聊天，也可以通过 `/help` 查看分镜项目命令。你刚才说：{text}"
+
+
+async def _dashscope_chat(*, model: str, text: str) -> str:
+    body = {
+        "model": model,
+        "messages": [
+            {"role": "system", "content": "你是飞书里的 AI 分镜项目助手。回答要简洁、直接、中文优先。"},
+            {"role": "user", "content": text},
+        ],
+        "temperature": 0.6,
+    }
+    async with httpx.AsyncClient(timeout=90) as client:
+        response = await client.post(
+            f"{settings.dashscope_compatible_base_url.rstrip('/')}/chat/completions",
+            headers={"Authorization": f"Bearer {settings.dashscope_api_key}", "Content-Type": "application/json"},
+            json=body,
+        )
+    response.raise_for_status()
+    data = response.json()
+    return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip() or "我没有生成有效回复。"
+
+
+async def _openai_chat(*, model: str, text: str) -> str:
+    body = {
+        "model": model,
+        "input": [
+            {"role": "system", "content": "你是飞书里的 AI 分镜项目助手。回答要简洁、直接、中文优先。"},
+            {"role": "user", "content": text},
+        ],
+    }
+    async with httpx.AsyncClient(timeout=90) as client:
+        response = await client.post(
+            f"{settings.openai_base_url.rstrip('/')}/v1/responses",
+            headers={"Authorization": f"Bearer {settings.openai_api_key}", "Content-Type": "application/json"},
+            json=body,
+        )
+    response.raise_for_status()
+    data = response.json()
+    if data.get("output_text"):
+        return str(data["output_text"]).strip()
+    for item in data.get("output", []):
+        for content in item.get("content", []):
+            if content.get("type") in {"output_text", "text"} and content.get("text"):
+                return str(content["text"]).strip()
+    return "我没有生成有效回复。"

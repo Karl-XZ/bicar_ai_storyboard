@@ -4,18 +4,20 @@ from app.services.bot_commands import _parse_create_project_command, _parse_proj
 
 
 def test_help_command_aliases():
-    for text in ["帮助", "help", "/help", "菜单", "命令", "指令", "使用说明", "说明"]:
+    for text in ["帮助", "help", "菜单", "命令", "指令", "使用说明", "说明"]:
         assert _is_help_command(text)
 
 
 def test_help_card_contains_core_commands():
     card = help_card()
     content = card["elements"][0]["content"]
-    assert "新建分镜项目：项目名" in content
-    assert "优化当前批次 Prompt" in content
-    assert "生成全部图片" in content
-    assert "生成全部视频" in content
+    assert "/新建分镜项目：项目名" in content
+    assert "/优化当前批次 Prompt" in content
+    assert "/生成全部图片" in content
+    assert "/生成全部视频" in content
+    assert "/切换chatbot模型 qwen-plus" in content
     assert "生成状态" in content
+    assert "重新生成状态" in content
     assert "满意度" in content
 
 

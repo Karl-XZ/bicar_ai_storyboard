@@ -102,7 +102,7 @@ class FeishuClient:
         data = {"parent_type": "explorer", "parent_node": folder_token, "file_name": name, "size": str(len(content))}
         async with httpx.AsyncClient(timeout=60) as client:
             response = await client.post(
-                f"{self.base_url}/open-apis/drive/v1/medias/upload_all",
+                f"{self.base_url}/open-apis/drive/v1/files/upload_all",
                 headers={"Authorization": f"Bearer {token}"},
                 data=data,
                 files=files,
