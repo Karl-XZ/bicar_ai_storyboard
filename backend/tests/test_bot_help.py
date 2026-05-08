@@ -1,4 +1,4 @@
-from app.adapters.feishu_cards import help_card
+from app.adapters.feishu_cards import chatbot_reply_card, help_card, render_feishu_markdown
 from app.api.routes.webhooks import _is_help_command, _message_text
 from app.services.bot_commands import _parse_chatbot_model_command, _parse_create_project_command, _parse_project_command
 
@@ -57,3 +57,25 @@ def test_text_project_commands_parse_to_card_actions():
 def test_chatbot_model_command_allows_new_providers():
     assert _parse_chatbot_model_command("切换chatbot模型 deepseek-v4-pro") == "deepseek-v4-pro"
     assert _parse_chatbot_model_command("chatbot模型 google/gemini-3.1-pro-preview") == "google/gemini-3.1-pro-preview"
+
+
+def test_chatbot_reply_card_uses_markdown_block():
+    card = chatbot_reply_card(content="**重点**\n- 第一条\n```python\nprint(1)\n```")
+    assert card["header"]["title"]["content"] == "AI 分镜助手"
+    assert card["elements"][0]["tag"] == "markdown"
+    assert "**重点**" in card["elements"][0]["content"]
+
+
+def test_render_feishu_markdown_converts_gfm_table_to_feishu_table_tag():
+    rendered = render_feishu_markdown(
+        "| 模型 | 状态 |\n| --- | --- |\n| qwen-plus | 可用 |\n| gpt-5.4 | 不可用 |"
+    )
+    assert rendered.startswith("<table ")
+    assert "columns={[{" in rendered
+    assert '"title": "模型"' in rendered
+    assert '"col_0": "qwen-plus"' in rendered
+
+
+def test_render_feishu_markdown_downgrades_h3_to_bold():
+    rendered = render_feishu_markdown("### 第三级标题\n正文")
+    assert rendered.splitlines()[0] == "**第三级标题**"

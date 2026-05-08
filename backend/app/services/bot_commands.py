@@ -7,14 +7,14 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app.adapters.feishu import FeishuClient
-from app.adapters.feishu_cards import help_card
+from app.adapters.feishu_cards import chatbot_reply_card, help_card
 from app.core.config import settings
 from app.models.project import Project
 from app.services.chat_memory import ChatMemoryService
 from app.services.feishu_storyboard import FeishuStoryboardService
 from app.services.projects import ProjectService
 
-LAST_MODEL_SMOKE_TEST_DATE = "2026-05-07"
+LAST_MODEL_SMOKE_TEST_DATE = "2026-05-08"
 
 
 async def handle_bot_text(
@@ -36,7 +36,7 @@ async def handle_bot_text(
             sender_open_id=sender_open_id,
         )
         if target_chat and reply:
-            await feishu.send_text(target_chat, reply)
+            await feishu.send_card(target_chat, chatbot_reply_card(content=reply))
         return {"message": "chatbot 已回复", "data": {"chat_id": target_chat}}
 
     command_text = _command_text(text)
@@ -294,20 +294,24 @@ def _chatbot_system_prompt(*, project: Project | None, session_type: str) -> str
 def _chatbot_capability_summary() -> str:
     return (
         f"最近一次模型 smoke test 时间：{LAST_MODEL_SMOKE_TEST_DATE}。\n"
-        "当前已验证可用的文本模型：qwen-plus、qwen-max。\n"
-        "当前已接入但实测不可用的文本模型：deepseek-v4-pro、deepseek-v4-flash、"
+        "当前已验证可用的文本模型：qwen-plus、qwen-max、deepseek-v4-pro、deepseek-v4-flash。\n"
+        "当前已接入但实测不可用的文本模型："
         "google/gemini-3.1-pro-preview、google/gemini-3.1-flash-lite-preview；"
         "这些模型最近一次实测都返回了 402 Payment Required，说明账号计费或余额侧不可用，不要推荐用户现在切过去。\n"
-        "OpenAI 直连文本模型 gpt-5.4 目前未配置 OPENAI_API_KEY，因此当前不可用。\n"
+        "OpenAI 直连文本模型 gpt-5.4 已接入，但最近一次实测返回 429 insufficient_quota / Too Many Requests，"
+        "说明当前 OpenAI 账号额度或计费状态不足，因此当前不要推荐用户切过去。\n"
         "当前已验证可用的图片模型：wanx2.1-t2i-turbo、wanx-v1。\n"
         "当前已接入但实测不可用的图片模型：openai/gpt-5.4-image-2、google/gemini-3.1-flash-image-preview、nano_banana_2；"
         "这些模型最近一次实测都返回了 402 Payment Required，当前不要建议用户使用。\n"
-        "OpenAI 直连图片模型 gpt_image_2 目前未配置 OPENAI_API_KEY，因此当前不可用。\n"
+        "Google 原生图片模型 gemini-3.1-flash-image-preview 已接入，但最近一次实测返回 429 RESOURCE_EXHAUSTED，"
+        "提示当前 Google API 免费层配额为 0，因此当前不可用。\n"
+        "OpenAI 直连图片模型 gpt-image-2 已适配当前 Image API，但最近一次实测返回 billing_hard_limit_reached，"
+        "说明当前 OpenAI 账号图像账单额度不足，因此当前不可用。\n"
         "当前已验证可提交并进入任务流程的视频模型：wan2.2-kf2v-flash、wanx2.1-kf2v-plus、wan2.2-t2v-plus、xyq_nest_video。\n"
         "xyq_nest_video 已正式接入当前项目，适合需要上传首帧、尾帧、参考图或关键帧参考的场景，可覆盖很多原本想用 seedance_2_0 的需求。\n"
         "wanx2.1-i2v-turbo 当前存在兼容问题，最近一次实测返回 InvalidParameter / url error，除非用户明确要求排查，否则不要优先推荐它。\n"
         "seedance_2_0 当前未配置 SEEDANCE_API_KEY、SEEDANCE_BASE_URL、SEEDANCE_MODEL_ID，因此当前不可用。\n"
-        "如果用户问“现在最稳妥怎么选”：默认优先建议 文本 qwen-plus 或 qwen-max，图片 wanx2.1-t2i-turbo 或 wanx-v1，"
+        "如果用户问“现在最稳妥怎么选”：默认优先建议 文本 qwen-plus、qwen-max、deepseek-v4-pro 或 deepseek-v4-flash，图片 wanx2.1-t2i-turbo 或 wanx-v1，"
         "视频优先按场景在 wan2.2-kf2v-flash、wanx2.1-kf2v-plus、wan2.2-t2v-plus、xyq_nest_video 之间选择。"
     )
 

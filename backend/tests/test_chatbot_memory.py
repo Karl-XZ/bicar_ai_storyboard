@@ -96,9 +96,11 @@ def test_chatbot_reply_uses_history_and_persists_turn(monkeypatch):
     assert isinstance(messages, list)
     assert "不能直接代替用户执行项目操作" in messages[0]["content"]
     assert "当前绑定项目：群聊项目" in messages[0]["content"]
-    assert "最近一次模型 smoke test 时间：2026-05-07" in messages[0]["content"]
+    assert "最近一次模型 smoke test 时间：2026-05-08" in messages[0]["content"]
     assert "xyq_nest_video 已正式接入当前项目" in messages[0]["content"]
     assert "402 Payment Required" in messages[0]["content"]
+    assert "deepseek-v4-pro、deepseek-v4-flash" in messages[0]["content"]
+    assert "429 insufficient_quota / Too Many Requests" in messages[0]["content"]
     assert messages[1:] == [
         {"role": "user", "content": "第一问"},
         {"role": "assistant", "content": "第一答"},
@@ -107,3 +109,40 @@ def test_chatbot_reply_uses_history_and_persists_turn(monkeypatch):
 
     stored = ChatMemoryService(db, chat_id="oc_group", chat_type="group", sender_open_id="ou_carol").recent_messages()
     assert [item.content for item in stored][-2:] == ["第二问", "第二答"]
+
+
+def test_handle_bot_text_sends_normal_chat_as_markdown_card(monkeypatch):
+    db = make_db()
+    sent: dict[str, object] = {}
+
+    class FakeFeishuClient:
+        async def send_card(self, receive_id: str, card: dict, receive_id_type: str = "chat_id") -> dict:
+            sent["receive_id"] = receive_id
+            sent["card"] = card
+            sent["receive_id_type"] = receive_id_type
+            return {"ok": True}
+
+        async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> dict:
+            raise AssertionError("normal chatbot replies should use markdown card instead of text")
+
+    async def fake_chatbot_reply(*args, **kwargs) -> str:
+        return "**回复重点**\n- 第一条\n- 第二条"
+
+    monkeypatch.setattr(bot_commands, "FeishuClient", FakeFeishuClient)
+    monkeypatch.setattr(bot_commands, "_chatbot_reply", fake_chatbot_reply)
+
+    result = asyncio.run(
+        bot_commands.handle_bot_text(
+            db,
+            text="给我一个总结",
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+        )
+    )
+
+    assert result == {"message": "chatbot 已回复", "data": {"chat_id": "oc_group"}}
+    assert sent["receive_id"] == "oc_group"
+    assert sent["receive_id_type"] == "chat_id"
+    assert sent["card"]["elements"][0]["tag"] == "markdown"
+    assert "**回复重点**" in sent["card"]["elements"][0]["content"]

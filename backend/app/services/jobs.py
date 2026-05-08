@@ -56,13 +56,25 @@ class JobService:
 
     def mark_running(self, job: GenerationJob) -> GenerationJob:
         job.status = JobStatus.RUNNING.value
+        job.error_code = None
+        job.error_message = None
         self.db.flush()
         return job
 
     def mark_succeeded(self, job: GenerationJob, output_payload: dict | None = None) -> GenerationJob:
         job.status = JobStatus.SUCCEEDED.value
+        job.error_code = None
+        job.error_message = None
         if output_payload is not None:
             job.output_payload = output_payload
+        self.db.flush()
+        return job
+
+    def mark_retrying(self, job: GenerationJob, error_code: str, error_message: str) -> GenerationJob:
+        job.status = JobStatus.RETRYING.value
+        job.retry_count += 1
+        job.error_code = error_code
+        job.error_message = error_message
         self.db.flush()
         return job
 
@@ -72,4 +84,3 @@ class JobService:
         job.error_message = error_message
         self.db.flush()
         return job
-

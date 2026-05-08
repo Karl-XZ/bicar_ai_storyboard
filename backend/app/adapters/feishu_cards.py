@@ -1,3 +1,9 @@
+from __future__ import annotations
+
+import json
+import re
+
+
 def project_overview_card(*, project_name: str, table_url: str | None, stats: dict) -> dict:
     return {
         "config": {"wide_screen_mode": True},
@@ -37,6 +43,130 @@ def project_overview_card(*, project_name: str, table_url: str | None, stats: di
         ],
         "header": {"title": {"tag": "plain_text", "content": "哔车 AI 分镜"}, "template": "orange"},
     }
+
+
+def chatbot_reply_card(*, content: str) -> dict:
+    markdown = render_feishu_markdown(content)
+    return {
+        "config": {"wide_screen_mode": True},
+        "header": {"title": {"tag": "plain_text", "content": "AI 分镜助手"}, "template": "wathet"},
+        "elements": [{"tag": "markdown", "content": markdown}],
+    }
+
+
+def render_feishu_markdown(content: str) -> str:
+    text = (content or "").strip() or "我暂时没有生成有效回复。"
+    text = _downgrade_unsupported_headings(text)
+    return _convert_markdown_tables(text)
+
+
+def _downgrade_unsupported_headings(text: str) -> str:
+    lines = []
+    for line in text.splitlines():
+        match = re.match(r"^(#{3,6})\s+(.+?)\s*$", line)
+        if match:
+            lines.append(f"**{match.group(2).strip()}**")
+        else:
+            lines.append(line)
+    return "\n".join(lines)
+
+
+def _convert_markdown_tables(text: str) -> str:
+    lines = text.splitlines()
+    converted: list[str] = []
+    index = 0
+    table_count = 0
+    in_code_block = False
+
+    while index < len(lines):
+        line = lines[index]
+        if line.strip().startswith("```"):
+            in_code_block = not in_code_block
+            converted.append(line)
+            index += 1
+            continue
+
+        if (
+            not in_code_block
+            and index + 1 < len(lines)
+            and _looks_like_table_row(line)
+            and _looks_like_table_separator(lines[index + 1])
+        ):
+            start = index
+            index += 2
+            table_lines = [line]
+            while index < len(lines) and _looks_like_table_row(lines[index]):
+                table_lines.append(lines[index])
+                index += 1
+            table_count += 1
+            converted.append(_table_block_to_feishu(table_lines, table_count=table_count))
+            if index < len(lines) and lines[index].strip() == "":
+                converted.append("")
+                index += 1
+            continue
+
+        converted.append(line)
+        index += 1
+
+    return "\n".join(converted).strip()
+
+
+def _looks_like_table_row(line: str) -> bool:
+    stripped = line.strip()
+    return stripped.startswith("|") and stripped.endswith("|") and stripped.count("|") >= 2
+
+
+def _looks_like_table_separator(line: str) -> bool:
+    stripped = line.strip()
+    if not (stripped.startswith("|") and stripped.endswith("|")):
+        return False
+    cells = _split_table_row(stripped)
+    if not cells:
+        return False
+    return all(re.fullmatch(r":?-{3,}:?", cell.strip()) for cell in cells)
+
+
+def _split_table_row(line: str) -> list[str]:
+    inner = line.strip().strip("|")
+    return [cell.strip() for cell in re.split(r"(?<!\\)\|", inner)]
+
+
+def _table_block_to_feishu(lines: list[str], *, table_count: int) -> str:
+    headers = _split_table_row(lines[0])
+    rows = [_split_table_row(line) for line in lines[1:]]
+    original = "\n".join(lines)
+
+    if not headers or table_count > 5 or len(headers) > 10:
+        return _table_fallback_block(headers=headers, rows=rows, original=original)
+
+    normalized_rows: list[dict[str, str]] = []
+    for raw_row in rows:
+        if len(raw_row) < len(headers):
+            raw_row = raw_row + [""] * (len(headers) - len(raw_row))
+        elif len(raw_row) > len(headers):
+            raw_row = raw_row[: len(headers)]
+        if all(re.fullmatch(r":?-{3,}:?", cell.strip()) for cell in raw_row):
+            continue
+        normalized_rows.append({f"col_{idx}": cell for idx, cell in enumerate(raw_row)})
+
+    columns = [{"title": title or f"列{idx + 1}", "dataIndex": f"col_{idx}"} for idx, title in enumerate(headers)]
+    return (
+        f"<table columns={{{json.dumps(columns, ensure_ascii=False)}}} "
+        f"data={{{json.dumps(normalized_rows, ensure_ascii=False)}}}/>"
+    )
+
+
+def _table_fallback_block(*, headers: list[str], rows: list[list[str]], original: str) -> str:
+    if not headers:
+        return f"```text\n{original}\n```"
+    body = []
+    data_rows = [row for row in rows if not all(re.fullmatch(r":?-{3,}:?", cell.strip()) for cell in row)]
+    for row_index, row in enumerate(data_rows, start=1):
+        values = row + [""] * max(len(headers) - len(row), 0)
+        body.append(f"**第 {row_index} 行**")
+        for header, value in zip(headers, values):
+            body.append(f"- `{header or '列'}`：{value}")
+    return "\n".join(body) if body else f"```text\n{original}\n```"
 
 
 def help_card() -> dict:

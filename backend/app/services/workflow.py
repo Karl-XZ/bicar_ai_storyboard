@@ -1,7 +1,11 @@
 import asyncio
 import hashlib
+import re
+from datetime import datetime
+from typing import Awaitable, Callable, TypeVar
 from uuid import UUID
 
+import httpx
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
@@ -15,6 +19,19 @@ from app.services.idempotency import make_idempotency_key
 from app.services.jobs import JobService
 from app.services.projects import ProjectService
 from app.services.state_machine import StateMachineService
+
+T = TypeVar("T")
+RATE_LIMIT_BACKOFF_SECONDS = (60, 300, 1200)
+RATE_LIMIT_PATTERNS = (
+    r"\b429\b",
+    r"too many requests",
+    r"rate limit",
+    r"rate[- ]limited",
+    r"resource[_ ]?exhausted",
+    r"throttl",
+    r"insufficient_quota",
+    r"quota exceeded",
+)
 
 
 class WorkflowError(RuntimeError):
@@ -269,13 +286,26 @@ class WorkflowService:
     async def _run_prompt_job(self, job: GenerationJob, shot: Shot) -> None:
         self.jobs.mark_running(job)
         provider = self.provider_router.text(job.provider)
-        result = await provider.optimize_prompt(
-            {
-                "scene_description": shot.scene_description,
-                "project_style": "cinematic realistic",
-                "model": job.model_id,
-            }
-        )
+        try:
+            result = await self._run_with_rate_limit_backoff(
+                shot=shot,
+                job=job,
+                operation_name="Prompt 优化",
+                failure_code="PROMPT_RATE_LIMIT_RETRY_EXHAUSTED",
+                runner=lambda: provider.optimize_prompt(
+                    {
+                        "scene_description": shot.scene_description,
+                        "project_style": "cinematic realistic",
+                        "model": job.model_id,
+                    }
+                ),
+            )
+        except WorkflowError as exc:
+            self.jobs.mark_failed(job, exc.code, exc.message)
+            raise
+        except Exception as exc:
+            self.jobs.mark_failed(job, type(exc).__name__, str(exc))
+            raise WorkflowError("PROMPT_FAILED", str(exc)) from exc
         existing_prompts = shot.prompts or {}
         shot.prompts = {
             **existing_prompts,
@@ -290,6 +320,8 @@ class WorkflowService:
         }
         shot.prompt_version += 1
         shot.status = ShotStatus.PENDING_FRAMES.value
+        shot.error_code = None
+        shot.error_message = None
         self.jobs.mark_succeeded(job, output_payload=shot.prompts)
 
     async def _run_image_job(
@@ -303,7 +335,16 @@ class WorkflowService:
         self.jobs.mark_running(job)
         provider = self.provider_router.image(job.provider)
         try:
-            result = await provider.generate_image(job.input_payload)
+            result = await self._run_with_rate_limit_backoff(
+                shot=shot,
+                job=job,
+                operation_name=f"{frame_type.value} 图片生成",
+                failure_code="IMAGE_RATE_LIMIT_RETRY_EXHAUSTED",
+                runner=lambda: provider.generate_image(job.input_payload),
+            )
+        except WorkflowError as exc:
+            self.jobs.mark_failed(job, exc.code, exc.message)
+            raise
         except Exception as exc:
             self.jobs.mark_failed(job, type(exc).__name__, str(exc))
             raise WorkflowError("IMAGE_FAILED", str(exc)) from exc
@@ -324,15 +365,33 @@ class WorkflowService:
             prompt_hash=prompt_hash,
             version=shot.prompt_version,
         )
+        shot.error_code = None
+        shot.error_message = None
         self.jobs.mark_succeeded(job, {"asset_id": str(asset.id), "url": asset.public_url})
 
     async def _run_video_job(self, job: GenerationJob, shot: Shot) -> None:
         self.jobs.mark_running(job)
         provider = self.provider_router.video(job.provider)
         try:
-            task = await provider.create_video_task(job.input_payload)
+            task = await self._run_with_rate_limit_backoff(
+                shot=shot,
+                job=job,
+                operation_name="视频任务创建",
+                failure_code="VIDEO_RATE_LIMIT_RETRY_EXHAUSTED",
+                runner=lambda: provider.create_video_task(job.input_payload),
+            )
             job.provider_task_id = task.provider_task_id
-            result = await provider.poll_video_task(task.provider_task_id)
+            result = await self._run_with_rate_limit_backoff(
+                shot=shot,
+                job=job,
+                operation_name="视频结果轮询",
+                failure_code="VIDEO_RATE_LIMIT_RETRY_EXHAUSTED",
+                runner=lambda: provider.poll_video_task(task.provider_task_id),
+            )
+        except WorkflowError as exc:
+            self.jobs.mark_failed(job, exc.code, exc.message)
+            shot.status = ShotStatus.VIDEO_FAILED.value
+            raise
         except Exception as exc:
             self.jobs.mark_failed(job, type(exc).__name__, str(exc))
             shot.status = ShotStatus.VIDEO_FAILED.value
@@ -355,7 +414,127 @@ class WorkflowService:
             version=shot.prompt_version,
         )
         shot.status = ShotStatus.PENDING_ACCEPTANCE.value
+        shot.error_code = None
+        shot.error_message = None
         self.jobs.mark_succeeded(job, {"asset_id": str(asset.id), "url": asset.public_url})
+
+    async def _run_with_rate_limit_backoff(
+        self,
+        *,
+        shot: Shot,
+        job: GenerationJob,
+        operation_name: str,
+        failure_code: str,
+        runner: Callable[[], Awaitable[T]],
+    ) -> T:
+        delays = RATE_LIMIT_BACKOFF_SECONDS
+        for attempt_index in range(len(delays) + 1):
+            if attempt_index > 0:
+                self.jobs.mark_running(job)
+            try:
+                return await runner()
+            except Exception as exc:
+                if not self._is_rate_limit_error(exc):
+                    raise
+                error_text = self._compact_error_message(exc)
+                if attempt_index >= len(delays):
+                    final_message = self._rate_limit_final_message(
+                        operation_name=operation_name,
+                        job=job,
+                        error_text=error_text,
+                    )
+                    shot.error_code = failure_code
+                    shot.error_message = self._append_error_log(shot.error_message, final_message)
+                    await self._sync_shot_error_log(shot)
+                    raise WorkflowError(failure_code, final_message) from exc
+
+                retry_number = attempt_index + 1
+                delay_seconds = delays[attempt_index]
+                retry_message = self._rate_limit_retry_message(
+                    operation_name=operation_name,
+                    job=job,
+                    retry_number=retry_number,
+                    delay_seconds=delay_seconds,
+                    error_text=error_text,
+                )
+                self.jobs.mark_retrying(job, "RATE_LIMITED", retry_message)
+                shot.error_code = "RATE_LIMITED"
+                shot.error_message = self._append_error_log(shot.error_message, retry_message)
+                await self._sync_shot_error_log(shot)
+                await asyncio.sleep(delay_seconds)
+
+        raise WorkflowError(failure_code, f"{operation_name} 回退重试异常结束")
+
+    def _is_rate_limit_error(self, exc: Exception) -> bool:
+        if isinstance(exc, httpx.HTTPStatusError):
+            response = exc.response
+            if response is not None and response.status_code == 429:
+                return True
+        response = getattr(exc, "response", None)
+        if response is not None and getattr(response, "status_code", None) == 429:
+            return True
+        text = self._compact_error_message(exc).lower()
+        return any(re.search(pattern, text) for pattern in RATE_LIMIT_PATTERNS)
+
+    def _compact_error_message(self, exc: Exception) -> str:
+        text = str(exc).strip()
+        if isinstance(exc, httpx.HTTPStatusError) and exc.response is not None:
+            details = exc.response.text.strip()
+            if details:
+                text = f"{text} | body={details}"
+        text = re.sub(r"\s+", " ", text)
+        return text[:500]
+
+    def _append_error_log(self, current: str | None, line: str) -> str:
+        existing_lines = [item for item in (current or "").splitlines() if item.strip()]
+        if line in existing_lines:
+            return "\n".join(existing_lines)
+        existing_lines.append(line)
+        return "\n".join(existing_lines[-12:])
+
+    def _rate_limit_retry_message(
+        self,
+        *,
+        operation_name: str,
+        job: GenerationJob,
+        retry_number: int,
+        delay_seconds: int,
+        error_text: str,
+    ) -> str:
+        return (
+            f"{self._now_label()} {operation_name}（{self._job_target_label(job)}）遇到限流类错误，"
+            f"将在 {self._delay_label(delay_seconds)} 后进行第{retry_number}次回退重试。错误：{error_text}"
+        )
+
+    def _rate_limit_final_message(self, *, operation_name: str, job: GenerationJob, error_text: str) -> str:
+        return (
+            f"{self._now_label()} {operation_name}（{self._job_target_label(job)}）第3次回退重试后仍遇到限流类错误，"
+            f"3次回退全部失败。最后错误：{error_text}"
+        )
+
+    def _job_target_label(self, job: GenerationJob) -> str:
+        provider = job.provider or "unknown"
+        model = job.model_id or "unknown"
+        return f"{provider}/{model}"
+
+    def _delay_label(self, delay_seconds: int) -> str:
+        mapping = {60: "1 分钟", 300: "5 分钟", 1200: "20 分钟"}
+        return mapping.get(delay_seconds, f"{delay_seconds} 秒")
+
+    def _now_label(self) -> str:
+        return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+    async def _sync_shot_error_log(self, shot: Shot) -> None:
+        project = self.projects.get_project(shot.project_id)
+        if not project or not project.feishu_app_token or not project.feishu_table_id or not shot.feishu_record_id:
+            self.db.commit()
+            return
+        try:
+            from app.services.feishu_storyboard import FeishuStoryboardService
+
+            await FeishuStoryboardService(self.db).backfill_shots(project, [shot])
+        except Exception:
+            self.db.commit()
 
     def _require_shot(self, shot_id: UUID) -> Shot:
         shot = self.db.get(Shot, shot_id)

@@ -235,7 +235,7 @@ class FeishuStoryboardService:
         except WorkflowError as exc:
             self._set_prompt_value(shot, "generation_status", GENERATION_STATUS_NOT_STARTED)
             shot.error_code = exc.code
-            shot.error_message = exc.message
+            shot.error_message = self._merge_error_message(shot.error_message, exc.message)
             self.db.commit()
             await self.backfill_shots(project, [shot])
             return False
@@ -308,7 +308,7 @@ class FeishuStoryboardService:
             except WorkflowError as exc:
                 self._set_prompt_value(shot, "image_generation_status", GENERATION_STATUS_NOT_STARTED)
                 shot.error_code = exc.code
-                shot.error_message = exc.message
+                shot.error_message = self._merge_error_message(shot.error_message, exc.message)
                 self.db.commit()
                 await self.backfill_shots(project, [shot])
             except Exception as exc:
@@ -553,7 +553,7 @@ class FeishuStoryboardService:
         except WorkflowError as exc:
             self._set_prompt_value(shot, "regeneration_status", GENERATION_STATUS_NOT_STARTED)
             shot.error_code = exc.code
-            shot.error_message = exc.message
+            shot.error_message = self._merge_error_message(shot.error_message, exc.message)
             self.db.commit()
             await self.backfill_shots(project, [shot])
             return False
@@ -677,6 +677,15 @@ class FeishuStoryboardService:
         if shot.status == ShotStatus.ARCHIVED_UNSATISFIED.value:
             return folders.get("unsatisfied")
         return folders.get("satisfied")
+
+    def _merge_error_message(self, current: str | None, incoming: str) -> str:
+        current_text = (current or "").strip()
+        incoming_text = (incoming or "").strip()
+        if not current_text:
+            return incoming_text
+        if not incoming_text or incoming_text in current_text:
+            return current_text
+        return f"{current_text}\n{incoming_text}"
 
     async def _apply_record_defaults(self, project: Project, records: list[dict]) -> None:
         if not project.feishu_app_token or not project.feishu_table_id:
