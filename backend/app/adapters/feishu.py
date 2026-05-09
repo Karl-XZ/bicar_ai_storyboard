@@ -84,6 +84,12 @@ class FeishuClient:
             json=field,
         )
 
+    async def delete_field(self, app_token: str, table_id: str, field_id: str) -> dict:
+        return await self._request(
+            "DELETE",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields/{field_id}",
+        )
+
     async def subscribe_file_events(self, file_token: str, file_type: str = "bitable") -> dict:
         return await self._request(
             "POST",

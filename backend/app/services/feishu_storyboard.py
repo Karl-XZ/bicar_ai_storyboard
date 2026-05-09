@@ -35,6 +35,7 @@ REGENERATE_OPTION_TO_PROMPT = {
     "视频提示词": "video_prompt",
 }
 REGENERATE_IMAGE_OPTIONS = {"关键帧重新生成", "首帧重新生成", "尾帧重新生成"}
+DEPRECATED_TABLE_FIELDS = {"镜号"}
 
 
 @dataclass(frozen=True)
@@ -427,6 +428,8 @@ class FeishuStoryboardService:
         if not project.feishu_app_token or not project.feishu_table_id:
             return []
         fields_response = await self.feishu.list_fields(project.feishu_app_token, project.feishu_table_id)
+        await self._delete_deprecated_fields(project, fields_response)
+        fields_response = await self.feishu.list_fields(project.feishu_app_token, project.feishu_table_id)
         field_map = build_field_map(fields_response)
         created: list[str] = []
         for definition in bitable_field_definitions():
@@ -435,6 +438,14 @@ class FeishuStoryboardService:
                 await self.feishu.create_field(project.feishu_app_token, project.feishu_table_id, definition)
                 created.append(name)
         return created
+
+    async def _delete_deprecated_fields(self, project: Project, fields_response: dict) -> None:
+        items = (fields_response.get("data") or {}).get("items") or []
+        for item in items:
+            field_name = item.get("field_name")
+            field_id = item.get("field_id")
+            if field_name in DEPRECATED_TABLE_FIELDS and field_id:
+                await self.feishu.delete_field(project.feishu_app_token, project.feishu_table_id, str(field_id))
 
     def progress_stats(self, project: Project) -> dict:
         shots = self.projects.list_shots(project.id)

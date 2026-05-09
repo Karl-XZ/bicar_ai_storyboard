@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
@@ -87,21 +88,16 @@ class FeishuWorkspaceService:
             document_id = self._extract_document_id(response)
             if not document_id:
                 raise RuntimeError("Feishu create_document did not return document_id")
-            await self.feishu.convert_document_markdown(document_id, markdown)
-            moved = False
-            for file_type in ("docx", "doc"):
-                try:
-                    await self.feishu.move_file(document_id, folder_token=target_folder, file_type=file_type)
-                    moved = True
-                    break
-                except FeishuApiError:
-                    continue
-            if moved:
-                return FeishuDocumentResult(
-                    document_id=document_id,
-                    url=self._doc_url(document_id),
-                    folder_token=target_folder,
-                )
+            blocks = self._markdown_to_blocks(markdown)
+            if blocks:
+                for chunk in self._chunk_blocks(blocks, size=50):
+                    await self.feishu.append_document_blocks(document_id, document_id, chunk)
+            await self.feishu.move_file(document_id, folder_token=target_folder, file_type="docx")
+            return FeishuDocumentResult(
+                document_id=document_id,
+                url=self._doc_url(document_id),
+                folder_token=target_folder,
+            )
         except FeishuApiError:
             pass
 
@@ -229,3 +225,56 @@ class FeishuWorkspaceService:
             except Exception:
                 pass
         return f"[binary file omitted] mime_type={mime_type} filename={filename} bytes={len(content)}"
+
+    def _markdown_to_blocks(self, markdown: str) -> list[dict]:
+        lines = (markdown or "").splitlines()
+        blocks: list[dict] = []
+        in_code = False
+        code_lines: list[str] = []
+        for raw_line in lines:
+            line = raw_line.rstrip()
+            if line.strip().startswith("```"):
+                if in_code and code_lines:
+                    blocks.append(self._paragraph_block("\n".join(code_lines)))
+                    code_lines = []
+                in_code = not in_code
+                continue
+            if in_code:
+                code_lines.append(line)
+                continue
+            stripped = line.strip()
+            if not stripped:
+                continue
+            if stripped.startswith(("# ", "## ", "### ", "#### ", "##### ", "###### ")):
+                blocks.append(self._paragraph_block(re.sub(r"^#+\s*", "", stripped)))
+                continue
+            if re.match(r"^[-*]\s+", stripped):
+                bullet_text = re.sub(r"^[-*]\s+", "", stripped)
+                blocks.append(self._paragraph_block(f"• {bullet_text}"))
+                continue
+            if re.match(r"^\\d+\\.\\s+", stripped):
+                blocks.append(self._paragraph_block(stripped))
+                continue
+            blocks.append(self._paragraph_block(stripped))
+        if in_code and code_lines:
+            blocks.append(self._paragraph_block("\n".join(code_lines)))
+        return blocks
+
+    def _paragraph_block(self, text: str) -> dict:
+        return {
+            "block_type": 2,
+            "text": {
+                "elements": [
+                    {
+                        "text_run": {
+                            "content": text,
+                        }
+                    }
+                ]
+            },
+        }
+
+    def _chunk_blocks(self, blocks: list[dict], *, size: int) -> list[list[dict]]:
+        if size <= 0:
+            return [blocks]
+        return [blocks[index : index + size] for index in range(0, len(blocks), size)]

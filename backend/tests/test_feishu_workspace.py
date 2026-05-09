@@ -8,6 +8,8 @@ class FakeFeishuClient:
     def __init__(self) -> None:
         self.moves = []
         self.uploads = []
+        self.appended_blocks = []
+        self.append_calls = []
 
     async def list_folder_items(self, folder_token: str, *, page_size: int = 200, page_token: str | None = None) -> dict:
         if folder_token == "parent_folder":
@@ -43,9 +45,11 @@ class FakeFeishuClient:
     async def create_document(self, title: str) -> dict:
         return {"code": 0, "data": {"document": {"document_id": "docx_123"}}}
 
-    async def convert_document_markdown(self, document_id: str, markdown: str) -> dict:
+    async def append_document_blocks(self, document_id: str, parent_block_id: str, blocks: list[dict]) -> dict:
         assert document_id == "docx_123"
-        assert "# 报告" in markdown
+        assert parent_block_id == "docx_123"
+        self.append_calls.append(list(blocks))
+        self.appended_blocks.extend(blocks)
         return {"code": 0, "data": {}}
 
     async def upload_file(self, folder_token: str, name: str, content: bytes) -> dict:
@@ -83,6 +87,21 @@ def test_workspace_service_saves_markdown_doc(monkeypatch):
     assert result.folder_token == "new_root"
     assert result.url.endswith("/docx/docx_123")
     assert fake.moves == [("docx_123", "new_root", "docx")]
+    assert fake.appended_blocks
+
+
+def test_workspace_service_chunks_large_markdown_into_multiple_append_calls(monkeypatch):
+    monkeypatch.setattr(settings, "feishu_root_folder_token", "new_root")
+    fake = FakeFeishuClient()
+    service = FeishuWorkspaceService(feishu=fake)
+    markdown = "\n".join(f"- 第 {index} 行" for index in range(1, 70))
+
+    result = asyncio.run(service.save_markdown_document(title="长报告", markdown=markdown))
+
+    assert result.document_id == "docx_123"
+    assert len(fake.append_calls) == 2
+    assert len(fake.append_calls[0]) == 50
+    assert len(fake.append_calls[1]) == 19
 
 
 def test_workspace_service_reads_doc_and_file_sources():

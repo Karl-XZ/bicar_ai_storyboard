@@ -30,6 +30,18 @@ class FakeFeishuClient:
         self.sent_cards = []
         self.updated_records = []
         self.uploaded_files = []
+        self.fields = [
+            {"field_name": "场景描述", "field_id": "fld_0"},
+            {"field_name": "生成批次", "field_id": "fld_1"},
+            {"field_name": "审核状态", "field_id": "fld_2"},
+            {"field_name": "首帧同步设置", "field_id": "fld_3"},
+            {"field_name": "关键帧生成设置", "field_id": "fld_4"},
+            {"field_name": "图片生成状态", "field_id": "fld_5"},
+            {"field_name": "生成状态", "field_id": "fld_6"},
+            {"field_name": "重新生成状态", "field_id": "fld_7"},
+            {"field_name": "Prompt 版本", "field_id": "fld_8"},
+        ]
+        self.deleted_fields = []
 
     async def send_card(self, receive_id: str, card: dict, receive_id_type: str = "chat_id") -> dict:
         self.sent_cards.append({"receive_id": receive_id, "card": card, "receive_id_type": receive_id_type})
@@ -49,21 +61,17 @@ class FakeFeishuClient:
         return {"code": 0, "data": {"items": self.records}}
 
     async def list_fields(self, app_token: str, table_id: str) -> dict:
-        names = [
-            "场景描述",
-            "生成批次",
-            "审核状态",
-            "首帧同步设置",
-            "关键帧生成设置",
-            "图片生成状态",
-            "生成状态",
-            "重新生成状态",
-            "Prompt 版本",
-        ]
-        return {"code": 0, "data": {"items": [{"field_name": name, "field_id": f"fld_{index}"} for index, name in enumerate(names)]}}
+        return {"code": 0, "data": {"items": list(self.fields)}}
 
     async def create_field(self, app_token: str, table_id: str, field: dict) -> dict:
+        field_id = f"fld_{len(self.fields)}"
+        self.fields.append({"field_name": field["field_name"], "field_id": field_id})
         return {"code": 0, "data": {"field": field}}
+
+    async def delete_field(self, app_token: str, table_id: str, field_id: str) -> dict:
+        self.deleted_fields.append(field_id)
+        self.fields = [field for field in self.fields if field["field_id"] != field_id]
+        return {"code": 0, "data": {"deleted": True, "field_id": field_id}}
 
     async def subscribe_file_events(self, file_token: str, file_type: str = "bitable") -> dict:
         return {"code": 0, "data": {}}
@@ -414,5 +422,31 @@ def test_sync_from_feishu_uses_actual_row_order_when_shot_no_field_missing(monke
             ("rec_002", "001"),
             ("rec_001", "002"),
         ]
+
+    asyncio.run(run_flow())
+
+
+def test_ensure_table_fields_deletes_legacy_shot_no_columns(monkeypatch):
+    import asyncio
+
+    async def run_flow():
+        monkeypatch.setattr(settings, "default_text_provider", "mock")
+        monkeypatch.setattr(settings, "default_image_provider", "mock")
+        monkeypatch.setattr(settings, "default_video_provider", "mock")
+        db = make_db()
+        fake = FakeFeishuClient()
+        fake.fields.extend(
+            [
+                {"field_name": "镜号", "field_id": "legacy_1"},
+                {"field_name": "镜号", "field_id": "legacy_2"},
+            ]
+        )
+        service = FeishuStoryboardService(db, feishu=fake)
+        provisioned = await service.create_project_from_bot(project_name="清理旧镜号字段项目", chat_id="oc_test")
+
+        await service.ensure_table_fields(provisioned.project)
+
+        assert fake.deleted_fields == ["legacy_1", "legacy_2"]
+        assert all(field["field_name"] != "镜号" for field in fake.fields)
 
     asyncio.run(run_flow())
