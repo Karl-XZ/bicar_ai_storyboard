@@ -1,8 +1,11 @@
 import base64
+import mimetypes
+from pathlib import Path
 
 import httpx
 
 from app.core.config import settings
+from app.core.model_aliases import resolve_openrouter_image_model
 from app.providers.base import ImageGenerationResult, ImageProvider
 
 
@@ -14,7 +17,7 @@ class OpenRouterImageProvider(ImageProvider):
         model = _resolve_model(payload.get("model") or settings.openrouter_image_model)
         body = {
             "model": model,
-            "messages": [{"role": "user", "content": prompt}],
+            "messages": [{"role": "user", "content": await _build_message_content(prompt=prompt, payload=payload)}],
             "modalities": ["image", "text"],
             "stream": False,
         }
@@ -46,10 +49,32 @@ class OpenRouterImageProvider(ImageProvider):
         raise RuntimeError("OpenRouter image response did not include inline image data")
 
 
+async def _build_message_content(*, prompt: str, payload: dict) -> list[dict]:
+    content = [{"type": "text", "text": prompt}]
+    for source in payload.get("reference_images") or payload.get("reference_image_urls") or []:
+        content.append({"type": "image_url", "image_url": {"url": await _to_image_url(str(source))}})
+    return content
+
+
+async def _to_image_url(source: str) -> str:
+    if source.startswith(("http://", "https://")):
+        return source
+    if source.startswith("file://"):
+        path = Path(source.replace("file://", ""))
+        if not path.exists():
+            raise RuntimeError(f"reference image does not exist: {path}")
+        mime_type = mimetypes.guess_type(path.name)[0] or "image/png"
+        encoded = base64.b64encode(path.read_bytes()).decode("ascii")
+        return f"data:{mime_type};base64,{encoded}"
+    return source
+
+
 def _resolve_model(model: str) -> str:
-    if model == "nano_banana_2":
-        return settings.openrouter_nano_banana_model
-    return model
+    return resolve_openrouter_image_model(
+        model,
+        default_openrouter_image_model=settings.openrouter_image_model,
+        default_nano_banana_model=settings.openrouter_nano_banana_model,
+    )
 
 
 def _aspect_ratio_from_size(size: str | None) -> str | None:

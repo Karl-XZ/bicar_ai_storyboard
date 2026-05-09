@@ -10,6 +10,7 @@ from typing import Any
 
 import httpx
 
+from app.adapters.feishu import FeishuClient
 from app.core.config import settings
 from app.providers.base import ImageGenerationResult, ImageProvider, PromptOptimizationResult, TextProvider, VideoProvider, VideoTaskResult
 
@@ -112,13 +113,13 @@ class DashScopeVideoProvider(VideoProvider):
             endpoint = "/services/aigc/image2video/video-synthesis"
             if "kf2v" not in model:
                 model = settings.dashscope_video_model
-            input_payload["first_frame_url"] = _image_input(first_frame_url)
-            input_payload["last_frame_url"] = _image_input(last_frame_url)
+            input_payload["first_frame_url"] = await _image_input(first_frame_url)
+            input_payload["last_frame_url"] = await _image_input(last_frame_url)
         elif first_frame_url or last_frame_url or reference_image_url:
             endpoint = "/services/aigc/image2video/video-synthesis"
             if "i2v" not in model:
                 model = settings.dashscope_i2v_model
-            input_payload["img_url"] = _image_input(first_frame_url or last_frame_url or reference_image_url)
+            input_payload["img_url"] = await _image_input(first_frame_url or last_frame_url or reference_image_url)
         elif "t2v" not in model:
             model = settings.dashscope_t2v_model
 
@@ -222,7 +223,7 @@ def _parse_json_object(text: str) -> dict[str, Any]:
         raise
 
 
-def _image_input(value: str | None) -> str:
+async def _image_input(value: str | None) -> str:
     if not value:
         raise DashScopeProviderError("DashScope image-to-video requires an input image")
     if value.startswith("file://"):
@@ -231,6 +232,16 @@ def _image_input(value: str | None) -> str:
             raise DashScopeProviderError(f"image file does not exist: {path}")
         mime_type = mimetypes.guess_type(path.name)[0] or "image/png"
         return f"data:{mime_type};base64,{base64.b64encode(path.read_bytes()).decode('ascii')}"
+    if value.startswith("feishu://"):
+        token = value.replace("feishu://", "", 1).strip().strip("/")
+        if not token:
+            raise DashScopeProviderError("DashScope image-to-video requires a valid Feishu file token")
+        try:
+            filename, content, mime_type = await FeishuClient().download_drive_file(token)
+        except Exception as exc:
+            raise DashScopeProviderError(f"failed to fetch reference asset: {value}") from exc
+        guessed = mime_type or mimetypes.guess_type(filename)[0] or "image/png"
+        return f"data:{guessed};base64,{base64.b64encode(content).decode('ascii')}"
     return value
 
 

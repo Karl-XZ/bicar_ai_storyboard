@@ -9,7 +9,9 @@ from urllib.parse import urlparse
 
 import httpx
 
+from app.adapters.feishu import FeishuClient
 from app.core.config import settings
+from app.core.model_aliases import VIDEO_MODEL_XYQ, normalize_video_model
 from app.providers.base import VideoProvider, VideoTaskResult
 
 SUBMIT_RUN_PATH = "/api/biz/v1/skill/submit_run"
@@ -49,7 +51,7 @@ class XYQNestVideoProvider(VideoProvider):
         thread_id = str(run.get("thread_id") or "").strip()
         run_id = str(run.get("run_id") or "").strip()
         if not thread_id or not run_id:
-            raise XYQNestProviderError("XYQ submit_run did not return thread_id/run_id")
+            raise XYQNestProviderError("小云雀 submit_run 未返回 thread_id/run_id")
         return VideoTaskResult(
             provider_task_id=_encode_task_ref(
                 _TaskRef(
@@ -76,7 +78,7 @@ class XYQNestVideoProvider(VideoProvider):
             thread = data.get("thread") or {}
             run_list = thread.get("run_list") or []
             if not run_list:
-                raise XYQNestProviderError("XYQ get_thread did not return run_list")
+                raise XYQNestProviderError("小云雀 get_thread 未返回 run_list")
             run = run_list[0] or {}
             run_state = _normalize_run_state(run.get("state"))
             last_message = _extract_text_summary(run) or last_message
@@ -85,18 +87,18 @@ class XYQNestVideoProvider(VideoProvider):
                 result_url = _extract_result_url(run)
                 if not result_url:
                     detail = f"：{last_message}" if last_message else ""
-                    raise XYQNestProviderError(f"XYQ task finished without a downloadable result{detail}")
+                    raise XYQNestProviderError(f"小云雀任务已完成，但没有可下载结果{detail}")
                 async with httpx.AsyncClient(timeout=180, follow_redirects=True) as client:
                     response = await client.get(result_url, headers={"User-Agent": "biche-storyboard/1.0"})
                 try:
                     response.raise_for_status()
                 except httpx.HTTPError as exc:
                     raise XYQNestProviderError(
-                        f"XYQ result download failed: status={response.status_code}, url={result_url}"
+                        f"小云雀结果下载失败：status={response.status_code}, url={result_url}"
                     ) from exc
                 mime_type = response.headers.get("content-type", "video/mp4").split(";")[0]
                 if not mime_type.startswith("video/") and not _looks_like_video_url(result_url):
-                    raise XYQNestProviderError(f"XYQ result is not a video asset: {result_url}")
+                    raise XYQNestProviderError(f"小云雀结果不是视频资产：{result_url}")
                 return {
                     "status": "succeeded",
                     "provider_task_id": provider_task_id,
@@ -110,14 +112,14 @@ class XYQNestVideoProvider(VideoProvider):
                 }
 
             if run_state == 4:
-                raise XYQNestProviderError(str(run.get("fail_reason") or "XYQ task failed"))
+                raise XYQNestProviderError(_normalize_xyq_failure_reason(str(run.get("fail_reason") or "小云雀任务失败")))
             if run_state == 5:
-                raise XYQNestProviderError("XYQ task was cancelled")
+                raise XYQNestProviderError("小云雀任务已取消")
             if attempt < attempts - 1:
                 await asyncio.sleep(interval)
 
         detail = f"：{last_message}" if last_message else ""
-        raise XYQNestProviderError(f"XYQ task timed out{detail}")
+        raise XYQNestProviderError(f"小云雀任务超时{detail}")
 
 
 async def _upload_assets_from_payload(payload: dict, access_key: str) -> list[_UploadedAsset]:
@@ -153,9 +155,17 @@ async def _materialize_file(source_url: str) -> tuple[str, bytes, str]:
     if source_url.startswith("file://"):
         path = Path(source_url.replace("file://", ""))
         if not path.exists():
-            raise XYQNestProviderError(f"XYQ source file does not exist: {path}")
+            raise XYQNestProviderError(f"小云雀源文件不存在：{path}")
         mime_type = mimetypes.guess_type(path.name)[0] or "application/octet-stream"
         return path.name, path.read_bytes(), mime_type
+    if source_url.startswith("feishu://"):
+        token = source_url.replace("feishu://", "", 1).strip().strip("/")
+        if not token:
+            raise XYQNestProviderError("小云雀飞书参考素材缺少文件 token")
+        try:
+            return await FeishuClient().download_drive_file(token)
+        except Exception as exc:
+            raise XYQNestProviderError(f"failed to fetch reference asset: {source_url}") from exc
 
     async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
         response = await client.get(source_url, headers={"User-Agent": "biche-storyboard/1.0"})
@@ -184,7 +194,7 @@ async def _upload_file(*, access_key: str, filename: str, content: bytes, mime_t
     data = _decode_response(response)
     asset_id = str(data.get("pippit_asset_id") or data.get("asset_id") or "").strip()
     if not asset_id:
-        raise XYQNestProviderError("XYQ upload_file did not return asset_id")
+        raise XYQNestProviderError("小云雀 upload_file 未返回 asset_id")
     return asset_id
 
 
@@ -205,22 +215,28 @@ def _decode_response(response: httpx.Response) -> dict:
     try:
         payload = response.json()
     except ValueError as exc:
-        raise XYQNestProviderError(f"XYQ returned non-JSON response: {response.text[:300]}") from exc
+        raise XYQNestProviderError(f"小云雀返回了非 JSON 响应：{response.text[:300]}") from exc
     try:
         response.raise_for_status()
     except httpx.HTTPError as exc:
         raise XYQNestProviderError(
-            f"XYQ HTTP error: status={response.status_code}, body={json.dumps(payload, ensure_ascii=False)[:300]}"
+            _normalize_xyq_failure_reason(
+                f"小云雀 HTTP 错误：status={response.status_code}, body={json.dumps(payload, ensure_ascii=False)[:300]}"
+            )
         ) from exc
     if str(payload.get("ret")) != "0":
-        raise XYQNestProviderError(f"XYQ API error: ret={payload.get('ret')}, errmsg={payload.get('errmsg')}")
+        raise XYQNestProviderError(
+            _normalize_xyq_failure_reason(
+                f"小云雀 API 错误：ret={payload.get('ret')}, errmsg={payload.get('errmsg')}"
+            )
+        )
     return payload.get("data") or {}
 
 
 def _build_video_message(payload: dict, uploaded_assets: list[_UploadedAsset]) -> str:
     prompt = str(payload.get("prompt") or "").strip()
     if not prompt:
-        raise XYQNestProviderError("XYQ video prompt is required")
+        raise XYQNestProviderError("小云雀视频提示词不能为空")
     lines = [
         "请直接生成 1 条分镜视频，不要反问，不要要求我补充信息，也不要输出多套方案。",
         "如有附件，请将其视为我已经确认好的参考素材，并直接完成创作。",
@@ -229,7 +245,7 @@ def _build_video_message(payload: dict, uploaded_assets: list[_UploadedAsset]) -
     camera_motion = str(payload.get("camera_motion") or "").strip()
     negative_prompt = str(payload.get("negative_prompt") or "").strip()
     duration_seconds = payload.get("duration_seconds")
-    model = str(payload.get("model") or payload.get("model_id") or settings.xyq_video_model).strip()
+    model = normalize_video_model(payload.get("model") or payload.get("model_id") or settings.xyq_video_model)
     if camera_motion:
         lines.append(f"镜头运动：{camera_motion}")
     if negative_prompt:
@@ -237,7 +253,7 @@ def _build_video_message(payload: dict, uploaded_assets: list[_UploadedAsset]) -
     if duration_seconds:
         lines.append(f"目标时长：{int(duration_seconds)} 秒")
     if model:
-        lines.append(f"任务标记：{model}")
+        lines.append(f"任务标记：{model or VIDEO_MODEL_XYQ}")
     if uploaded_assets:
         lines.append("附件说明：")
         for index, asset in enumerate(uploaded_assets, start=1):
@@ -266,13 +282,13 @@ def _encode_task_ref(task_ref: _TaskRef) -> str:
 def _decode_task_ref(provider_task_id: str) -> _TaskRef:
     raw = str(provider_task_id or "").strip()
     if not raw:
-        raise XYQNestProviderError("XYQ provider_task_id is empty")
+        raise XYQNestProviderError("小云雀 provider_task_id 不能为空")
     if raw.startswith("{"):
         parsed = json.loads(raw)
         thread_id = str(parsed.get("thread_id") or "").strip()
         run_id = str(parsed.get("run_id") or "").strip()
         if not thread_id or not run_id:
-            raise XYQNestProviderError("XYQ provider_task_id is invalid")
+            raise XYQNestProviderError("小云雀 provider_task_id 无效")
         return _TaskRef(
             thread_id=thread_id,
             run_id=run_id,
@@ -282,7 +298,7 @@ def _decode_task_ref(provider_task_id: str) -> _TaskRef:
         thread_id, run_id = raw.split("|", 1)
         if thread_id and run_id:
             return _TaskRef(thread_id=thread_id, run_id=run_id)
-    raise XYQNestProviderError("XYQ provider_task_id format is not supported")
+    raise XYQNestProviderError("小云雀 provider_task_id 格式暂不支持")
 
 
 def _extract_result_url(run: dict) -> str | None:
@@ -295,7 +311,10 @@ def _extract_result_url(run: dict) -> str | None:
 
 def _collect_media_urls(value, *, video_hint: bool = False) -> list[tuple[str, bool]]:
     candidates: list[tuple[str, bool]] = []
-    if isinstance(value, dict):
+    parsed_json = _parse_nested_json(value)
+    if parsed_json is not None:
+        candidates.extend(_collect_media_urls(parsed_json, video_hint=video_hint))
+    elif isinstance(value, dict):
         current_hint = video_hint or _mapping_looks_like_video(value)
         url = value.get("url")
         if isinstance(url, str) and url.startswith(("http://", "https://")):
@@ -330,7 +349,10 @@ def _extract_text_summary(run: dict) -> str:
 
 def _collect_text_fragments(value) -> list[str]:
     fragments: list[str] = []
-    if isinstance(value, str):
+    parsed_json = _parse_nested_json(value)
+    if parsed_json is not None:
+        fragments.extend(_collect_text_fragments(parsed_json))
+    elif isinstance(value, str):
         stripped = value.strip()
         if stripped:
             fragments.append(stripped)
@@ -349,6 +371,56 @@ def _looks_like_video_url(url: str) -> bool:
     return path.endswith(VIDEO_SUFFIXES)
 
 
+def _normalize_xyq_failure_reason(message: str) -> str:
+    normalized = (message or "").strip()
+    lower = normalized.lower()
+    human_image_patterns = (
+        "真人",
+        "人物",
+        "人脸",
+        "人像",
+        "portrait",
+        "real person",
+        "real-person",
+        "human face",
+        "human image",
+        "face image",
+        "facial",
+    )
+    policy_patterns = (
+        "not allowed",
+        "not support",
+        "unsupported",
+        "forbidden",
+        "prohibit",
+        "reject",
+        "refuse",
+        "审核",
+        "风控",
+        "违规",
+        "敏感",
+        "安全",
+        "policy",
+        "compliance",
+        "moderation",
+    )
+    if any(pattern in lower for pattern in human_image_patterns) and any(pattern in lower for pattern in policy_patterns):
+        return "小云雀 当前不支持上传真人参考图。请改用非真人参考图，或切换到其他视频模型后重试。"
+    return normalized
+
+
+def _parse_nested_json(value):
+    if not isinstance(value, str):
+        return None
+    stripped = value.strip()
+    if not stripped or stripped[0] not in "{[":
+        return None
+    try:
+        return json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+
+
 def _normalize_run_state(value) -> int | None:
     try:
         return int(value)
@@ -358,5 +430,5 @@ def _normalize_run_state(value) -> int | None:
 
 def _require_access_key() -> str:
     if not settings.xyq_access_key:
-        raise XYQNestProviderError("XYQ_ACCESS_KEY is required")
+        raise XYQNestProviderError("XYQ_ACCESS_KEY 未配置")
     return settings.xyq_access_key

@@ -1,5 +1,7 @@
 from dataclasses import dataclass
 
+from app.core.model_aliases import image_model_options, video_model_options
+
 
 @dataclass(frozen=True)
 class StoryboardField:
@@ -9,7 +11,6 @@ class StoryboardField:
 
 
 STORYBOARD_FIELDS: tuple[StoryboardField, ...] = (
-    StoryboardField("镜号", True, "排序和文件命名"),
     StoryboardField("场景描述", True, "粗略分镜描述"),
     StoryboardField("参考图", False, "视觉方向参考"),
     StoryboardField("关键帧提示词", False, "核心画面 Prompt"),
@@ -22,6 +23,7 @@ STORYBOARD_FIELDS: tuple[StoryboardField, ...] = (
     StoryboardField("文本模型", False, "Prompt 优化模型"),
     StoryboardField("生成批次", True, "批量操作筛选"),
     StoryboardField("首帧同步设置", True, "是否用上一镜尾帧作为本镜首帧"),
+    StoryboardField("关键帧生成设置", True, "是否为当前镜头生成关键帧候选"),
     StoryboardField("图片模型", False, "默认 DashScope 万相，也可切换其他图片模型"),
     StoryboardField("图片生成状态", True, "图片生成控制"),
     StoryboardField("关键帧图", False, "AI 生成候选"),
@@ -67,6 +69,7 @@ def bitable_field_definitions() -> list[dict]:
     single_select_fields = {
         "审核状态",
         "首帧同步设置",
+        "关键帧生成设置",
         "图片生成状态",
         "生成状态",
         "重新生成状态",
@@ -111,6 +114,8 @@ def bitable_field_definitions() -> list[dict]:
             }
         elif field.name == "首帧同步设置":
             item["property"] = {"options": [{"name": "否"}, {"name": "是"}]}
+        elif field.name == "关键帧生成设置":
+            item["property"] = {"options": [{"name": "否"}, {"name": "是"}]}
         elif field.name in {"图片生成状态", "生成状态", "重新生成状态"}:
             item["property"] = {"options": [{"name": "未开始"}, {"name": "启动"}, {"name": "正在生成"}, {"name": "生成完成"}]}
         elif field.name == "需要重新生成的选项":
@@ -141,25 +146,8 @@ def bitable_field_definitions() -> list[dict]:
                 ]
             }
         elif field.name == "图片模型":
-            item["property"] = {
-                "options": [
-                    {"name": "wanx2.1-t2i-turbo"},
-                    {"name": "wanx-v1"},
-                    {"name": "nano_banana_2"},
-                    {"name": "gpt_image_2"},
-                    {"name": "openai/gpt-5.4-image-2"},
-                    {"name": "google/gemini-3.1-flash-image-preview"},
-                ]
-            }
+            item["property"] = {"options": [{"name": name} for name in image_model_options()]}
         elif field.name == "视频模型":
-            item["property"] = {
-                "options": [
-                    {"name": "wan2.2-kf2v-flash"},
-                    {"name": "wanx2.1-kf2v-plus"},
-                    {"name": "wanx2.1-i2v-turbo"},
-                    {"name": "seedance_2_0"},
-                    {"name": "xyq_nest_video"},
-                ]
-            }
+            item["property"] = {"options": [{"name": name} for name in video_model_options()]}
         fields.append(item)
     return fields

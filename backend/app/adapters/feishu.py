@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import mimetypes
+import re
+from urllib.parse import unquote
 from typing import Any
 
 import httpx
@@ -96,6 +98,50 @@ class FeishuClient:
             json={"folder_token": parent_token, "name": name},
         )
 
+    async def list_folder_items(self, folder_token: str, *, page_size: int = 200, page_token: str | None = None) -> dict:
+        params = {"folder_token": folder_token, "page_size": page_size}
+        if page_token:
+            params["page_token"] = page_token
+        return await self._request(
+            "GET",
+            "/open-apis/drive/v1/files",
+            params=params,
+        )
+
+    async def move_file(self, file_token: str, *, folder_token: str, file_type: str = "file") -> dict:
+        return await self._request(
+            "POST",
+            f"/open-apis/drive/v1/files/{file_token}/move",
+            json={"type": file_type, "folder_token": folder_token},
+        )
+
+    async def create_document(self, title: str) -> dict:
+        return await self._request(
+            "POST",
+            "/open-apis/docx/v1/documents",
+            json={"title": title},
+        )
+
+    async def get_document_raw_content(self, document_id: str) -> dict:
+        return await self._request(
+            "GET",
+            f"/open-apis/docx/v1/documents/{document_id}/raw_content",
+        )
+
+    async def convert_document_markdown(self, document_id: str, markdown: str) -> dict:
+        return await self._request(
+            "POST",
+            f"/open-apis/docx/v1/documents/{document_id}/convert",
+            json={"content": markdown, "content_type": "markdown"},
+        )
+
+    async def append_document_blocks(self, document_id: str, parent_block_id: str, children: list[dict], *, index: int = -1) -> dict:
+        return await self._request(
+            "POST",
+            f"/open-apis/docx/v1/documents/{document_id}/blocks/{parent_block_id}/children",
+            json={"children": children, "index": index},
+        )
+
     async def upload_file(self, folder_token: str, name: str, content: bytes) -> dict:
         token = await self.auth.get_tenant_access_token()
         files = {"file": (name, content)}
@@ -123,6 +169,40 @@ class FeishuClient:
                 files=files,
             )
         return self._decode_response(response)
+
+    async def download_drive_file(self, file_token: str) -> tuple[str, bytes, str]:
+        token = await self.auth.get_tenant_access_token()
+        errors: list[Exception] = []
+        for path in (
+            f"/open-apis/drive/v1/files/{file_token}/download",
+            f"/open-apis/drive/v1/medias/{file_token}/download",
+        ):
+            try:
+                return await self._download_binary(path, token=token, file_token=file_token)
+            except FeishuApiError as exc:
+                errors.append(exc)
+                continue
+        raise FeishuApiError(
+            f"Feishu download error: file_token={file_token}",
+            body={"errors": [str(item) for item in errors]},
+        )
+
+    async def _download_binary(self, path: str, *, token: str, file_token: str) -> tuple[str, bytes, str]:
+        async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
+            response = await client.get(
+                f"{self.base_url}{path}",
+                headers={"Authorization": f"Bearer {token}"},
+            )
+        try:
+            response.raise_for_status()
+        except httpx.HTTPError as exc:
+            raise FeishuApiError(
+                f"Feishu download error: status={response.status_code}, file_token={file_token}, path={path}"
+            ) from exc
+        content_type = response.headers.get("content-type", "application/octet-stream").split(";")[0]
+        disposition = response.headers.get("content-disposition", "")
+        filename = _filename_from_disposition(disposition) or f"{file_token}{mimetypes.guess_extension(content_type) or ''}"
+        return filename, response.content, content_type
 
     async def _request(
         self,
@@ -162,3 +242,15 @@ class FeishuClient:
                 body=body,
             )
         return body
+
+
+def _filename_from_disposition(value: str) -> str | None:
+    if not value:
+        return None
+    match = re.search(r"filename\*=UTF-8''([^;]+)", value, flags=re.IGNORECASE)
+    if match:
+        return unquote(match.group(1)).strip('"')
+    match = re.search(r'filename="?([^";]+)"?', value, flags=re.IGNORECASE)
+    if match:
+        return unquote(match.group(1))
+    return None

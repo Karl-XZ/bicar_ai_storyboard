@@ -56,7 +56,7 @@ class RateLimitedVideoProvider:
     async def create_video_task(self, payload: dict) -> VideoTaskResult:
         self.create_calls += 1
         if self.create_calls <= self.failures:
-            raise RuntimeError("429 Too Many Requests from XYQ")
+            raise RuntimeError("429 Too Many Requests from 小云雀")
         return VideoTaskResult(provider_task_id="video-task-1")
 
     async def poll_video_task(self, provider_task_id: str) -> dict:
@@ -164,7 +164,7 @@ def test_video_rate_limit_retries_then_succeeds(monkeypatch):
             default_text_provider="mock",
             default_text_model="mock-text-v1",
             default_video_provider="xyq_nest",
-            default_video_model="xyq_nest_video",
+            default_video_model="小云雀",
             initial_shots=[ShotCreate(shot_no="001", scene_description="追车镜头")],
         )
     )
@@ -190,8 +190,8 @@ def test_video_rate_limit_retries_then_succeeds(monkeypatch):
 
     db.refresh(shot)
     assert job.status == "succeeded"
-    assert sleeps == [60]
-    assert logs and "xyq_nest/xyq_nest_video" in logs[0]
+    assert sleeps == [300]
+    assert logs and "小云雀/小云雀" in logs[0]
     assert "第1次回退重试" in logs[0]
     assert shot.status == ShotStatus.PENDING_ACCEPTANCE.value
     assert shot.error_code is None

@@ -1,4 +1,5 @@
 from app.core.config import settings
+from app.core.model_aliases import IMAGE_MODEL_GPT2, IMAGE_MODEL_NEOBUNANA
 from app.providers.base import ImageProvider, TextProvider, VideoProvider
 from app.providers.deepseek_text import DeepSeekTextProvider
 from app.providers.dashscope import DashScopeImageProvider, DashScopeTextProvider, DashScopeVideoProvider
@@ -29,12 +30,17 @@ class ProviderRouter:
         selected = provider or settings.default_image_provider
         if selected == "dashscope" and settings.dashscope_api_key:
             return DashScopeImageProvider()
-        if selected in {"openai", "gpt_image_2"} and settings.openai_api_key:
-            return OpenAIImageProvider()
-        if selected == "nano_banana_2" and settings.google_api_key:
-            return GoogleNanoBanana2Provider()
+        if selected in {"gpt_image_2", IMAGE_MODEL_GPT2} and settings.openrouter_api_key:
+            return OpenRouterImageProvider()
+        if selected in {"nano_banana_2", IMAGE_MODEL_NEOBUNANA}:
+            if settings.openrouter_api_key:
+                return OpenRouterImageProvider()
+            if settings.google_api_key:
+                return GoogleNanoBanana2Provider()
         if selected == "openrouter" and settings.openrouter_api_key:
             return OpenRouterImageProvider()
+        if selected in {"openai", "gpt_image_2"} and settings.openai_api_key:
+            return OpenAIImageProvider()
         return MockImageProvider()
 
     def video(self, provider: str | None = None) -> VideoProvider:

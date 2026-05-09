@@ -32,11 +32,14 @@ class Settings(BaseSettings):
     feishu_encrypt_key: str = ""
     feishu_default_chat_id: str = ""
     feishu_root_folder_token: str = "root"
+    feishu_workspace_parent_url: str = "https://ocnwptzvwvt6.feishu.cn/drive/folder/TcAUfNw3nlk8eTdrPWxc0kK3nJe"
+    feishu_workspace_folder_name: str = "AI分镜"
 
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com"
     openai_text_model: str = "gpt-5.4"
     openai_image_model: str = "gpt-image-2"
+    openai_deep_research_model: str = "o4-mini-deep-research"
 
     deepseek_api_key: str = ""
     deepseek_base_url: str = "https://api.deepseek.com"
@@ -63,9 +66,9 @@ class Settings(BaseSettings):
     dashscope_video_resolution: str = "720P"
     dashscope_prompt_extend: bool = True
 
-    default_text_provider: str = "dashscope"
-    default_image_provider: str = "dashscope"
-    default_video_provider: str = "dashscope"
+    default_text_provider: str = "deepseek"
+    default_image_provider: str = "openrouter"
+    default_video_provider: str = "xyq_nest"
 
     google_api_key: str = ""
     google_base_url: str = "https://generativelanguage.googleapis.com"
@@ -78,7 +81,7 @@ class Settings(BaseSettings):
 
     xyq_access_key: str = ""
     xyq_base_url: str = "https://xyq.jianying.com"
-    xyq_video_model: str = "xyq_nest_video"
+    xyq_video_model: str = "小云雀"
 
     chatbot_memory_rounds: int = Field(default=20, ge=0)
     image_parallel_per_project: int = Field(default=10, ge=1)

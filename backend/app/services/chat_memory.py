@@ -89,6 +89,11 @@ class ChatMemoryService:
         if stale_ids:
             self.db.execute(delete(ChatMessage).where(ChatMessage.id.in_(stale_ids)))
 
+    def clear(self) -> int:
+        result = self.db.execute(delete(ChatMessage).where(ChatMessage.session_key == self.session.session_key))
+        self.db.flush()
+        return int(result.rowcount or 0)
+
 
 def resolve_chat_session(*, chat_id: str | None, chat_type: str | None, sender_open_id: str | None) -> ChatSession:
     normalized_chat_type = (chat_type or "").strip().lower()

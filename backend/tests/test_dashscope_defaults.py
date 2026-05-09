@@ -4,6 +4,7 @@ from sqlalchemy.orm import sessionmaker
 from app.core.config import settings
 from app.domain.schemas import CreateProjectRequest, ShotCreate
 from app.models import Base
+from app.providers.dashscope import _image_input
 from app.services.projects import ProjectService
 from app.services.workflow import WorkflowService
 
@@ -54,11 +55,25 @@ def test_cross_provider_model_override_is_inferred(monkeypatch):
     shot.prompts = {
         "text_model": "deepseek-v4-pro",
         "image_model": "openai/gpt-5.4-image-2",
-        "video_model": "xyq_nest_video",
+        "video_model": "小云雀",
     }
     db.commit()
     workflow = WorkflowService(db)
 
     assert workflow._provider_model(shot, "text") == ("deepseek", "deepseek-v4-pro")
     assert workflow._provider_model(shot, "image") == ("openrouter", "openai/gpt-5.4-image-2")
-    assert workflow._provider_model(shot, "video") == ("xyq_nest", "xyq_nest_video")
+    assert workflow._provider_model(shot, "video") == ("xyq_nest", "小云雀")
+
+
+def test_dashscope_image_input_supports_feishu_file_tokens(monkeypatch):
+    import asyncio
+
+    async def fake_download_drive_file(self, file_token):
+        assert file_token == "img_tok_123"
+        return ("reference.png", b"\x89PNG\r\n", "image/png")
+
+    monkeypatch.setattr("app.providers.dashscope.FeishuClient.download_drive_file", fake_download_drive_file)
+
+    data_url = asyncio.run(_image_input("feishu://img_tok_123"))
+
+    assert data_url.startswith("data:image/png;base64,")

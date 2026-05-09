@@ -89,6 +89,47 @@ class FakeAsyncClient:
         raise AssertionError(f"Unexpected URL: {url}")
 
 
+class FakeAsyncClientWithStringifiedArtifact(FakeAsyncClient):
+    async def post(self, url, headers=None, json=None, data=None, files=None):
+        if url.endswith("/get_thread"):
+            return httpx.Response(
+                200,
+                json={
+                    "ret": "0",
+                    "errmsg": "",
+                    "data": {
+                        "thread": {
+                            "run_list": [
+                                {
+                                    "state": 3,
+                                    "entry_list": [
+                                        {
+                                            "type": 2,
+                                            "artifact": {
+                                                "artifact_id": "artifact-1",
+                                                "content": [
+                                                    {
+                                                        "type": "data",
+                                                        "sub_type": "biz/x_data_video",
+                                                        "data": (
+                                                            '{"video":{"url":"https://download.example/video.mp4",'
+                                                            '"metadata":{"ratio":"16:9"}}}'
+                                                        ),
+                                                    }
+                                                ],
+                                            },
+                                        }
+                                    ],
+                                }
+                            ]
+                        }
+                    },
+                },
+                request=httpx.Request("POST", url),
+            )
+        return await super().post(url, headers=headers, json=json, data=data, files=files)
+
+
 def test_xyq_provider_submits_with_uploaded_assets(monkeypatch, tmp_path):
     first_frame = tmp_path / "first.png"
     last_frame = tmp_path / "last.png"
@@ -116,11 +157,94 @@ def test_xyq_provider_submits_with_uploaded_assets(monkeypatch, tmp_path):
     assert payload["run_id"] == "run-456"
 
 
+def test_xyq_provider_uploads_feishu_reference_asset(monkeypatch):
+    async def fake_download_drive_file(self, file_token):
+        assert file_token == "file_tok_123"
+        return ("reference.png", b"feishu-image-bytes", "image/png")
+
+    monkeypatch.setattr(settings, "xyq_access_key", "test-xyq-key")
+    monkeypatch.setattr(settings, "xyq_base_url", "https://xyq.jianying.com")
+    monkeypatch.setattr("app.providers.xyq_nest.httpx.AsyncClient", FakeAsyncClient)
+    monkeypatch.setattr("app.providers.xyq_nest.FeishuClient.download_drive_file", fake_download_drive_file)
+
+    task = asyncio.run(
+        XYQNestVideoProvider().create_video_task(
+            {
+                "prompt": "参考图驱动的短视频",
+                "reference_image_url": "feishu://file_tok_123",
+            }
+        )
+    )
+
+    payload = json.loads(task.provider_task_id)
+    assert payload["thread_id"] == "thread-123"
+    assert payload["run_id"] == "run-456"
+
+
+def test_xyq_provider_normalizes_human_reference_policy_error(monkeypatch):
+    monkeypatch.setattr(settings, "xyq_access_key", "test-xyq-key")
+    monkeypatch.setattr(settings, "xyq_base_url", "https://xyq.jianying.com")
+    monkeypatch.setattr(settings, "video_max_polling_attempts", 1)
+
+    class FakeAsyncClientWithPolicyFailure(FakeAsyncClient):
+        async def post(self, url, headers=None, json=None, data=None, files=None):
+            if url.endswith("/get_thread"):
+                return httpx.Response(
+                    200,
+                    json={
+                        "ret": "0",
+                        "errmsg": "",
+                        "data": {
+                            "thread": {
+                                "run_list": [
+                                    {
+                                        "state": 4,
+                                        "fail_reason": "reference human face image is not allowed by policy",
+                                    }
+                                ]
+                            }
+                        },
+                    },
+                    request=httpx.Request("POST", url),
+                )
+            return await super().post(url, headers=headers, json=json, data=data, files=files)
+
+    monkeypatch.setattr("app.providers.xyq_nest.httpx.AsyncClient", FakeAsyncClientWithPolicyFailure)
+
+    try:
+        asyncio.run(
+            XYQNestVideoProvider().poll_video_task(
+                json.dumps({"thread_id": "thread-123", "run_id": "run-456"}, separators=(",", ":"))
+            )
+        )
+    except Exception as exc:
+        assert str(exc) == "小云雀 当前不支持上传真人参考图。请改用非真人参考图，或切换到其他视频模型后重试。"
+    else:
+        raise AssertionError("expected 小云雀 human-image policy failure")
+
+
 def test_xyq_provider_polls_and_downloads_video(monkeypatch):
     monkeypatch.setattr(settings, "xyq_access_key", "test-xyq-key")
     monkeypatch.setattr(settings, "xyq_base_url", "https://xyq.jianying.com")
     monkeypatch.setattr(settings, "video_max_polling_attempts", 1)
     monkeypatch.setattr("app.providers.xyq_nest.httpx.AsyncClient", FakeAsyncClient)
+
+    result = asyncio.run(
+        XYQNestVideoProvider().poll_video_task(
+            json.dumps({"thread_id": "thread-123", "run_id": "run-456"}, separators=(",", ":"))
+        )
+    )
+
+    assert result["status"] == "succeeded"
+    assert result["video_bytes"] == b"video-bytes"
+    assert result["mime_type"] == "video/mp4"
+
+
+def test_xyq_provider_polls_stringified_artifact_payload(monkeypatch):
+    monkeypatch.setattr(settings, "xyq_access_key", "test-xyq-key")
+    monkeypatch.setattr(settings, "xyq_base_url", "https://xyq.jianying.com")
+    monkeypatch.setattr(settings, "video_max_polling_attempts", 1)
+    monkeypatch.setattr("app.providers.xyq_nest.httpx.AsyncClient", FakeAsyncClientWithStringifiedArtifact)
 
     result = asyncio.run(
         XYQNestVideoProvider().poll_video_task(

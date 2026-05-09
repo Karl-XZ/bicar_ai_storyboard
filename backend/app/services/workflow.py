@@ -9,6 +9,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
+from app.core.model_aliases import IMAGE_MODEL_NEOBUNANA, normalize_image_model, normalize_video_model, video_provider_display
 from app.domain.enums import AssetType, FrameType, JobStatus, JobType, Satisfaction, ShotStatus
 from app.models.asset import Asset
 from app.models.job import GenerationJob
@@ -22,6 +23,7 @@ from app.services.state_machine import StateMachineService
 
 T = TypeVar("T")
 RATE_LIMIT_BACKOFF_SECONDS = (60, 300, 1200)
+XYQ_RATE_LIMIT_BACKOFF_SECONDS = (300, 600, 1200, 1800, 3600)
 RATE_LIMIT_PATTERNS = (
     r"\b429\b",
     r"too many requests",
@@ -427,7 +429,7 @@ class WorkflowService:
         failure_code: str,
         runner: Callable[[], Awaitable[T]],
     ) -> T:
-        delays = RATE_LIMIT_BACKOFF_SECONDS
+        delays = self._rate_limit_delays(job)
         for attempt_index in range(len(delays) + 1):
             if attempt_index > 0:
                 self.jobs.mark_running(job)
@@ -507,18 +509,26 @@ class WorkflowService:
         )
 
     def _rate_limit_final_message(self, *, operation_name: str, job: GenerationJob, error_text: str) -> str:
+        retry_count = len(self._rate_limit_delays(job))
         return (
-            f"{self._now_label()} {operation_name}（{self._job_target_label(job)}）第3次回退重试后仍遇到限流类错误，"
-            f"3次回退全部失败。最后错误：{error_text}"
+            f"{self._now_label()} {operation_name}（{self._job_target_label(job)}）第{retry_count}次回退重试后仍遇到限流类错误，"
+            f"{retry_count}次回退全部失败。最后错误：{error_text}"
         )
 
     def _job_target_label(self, job: GenerationJob) -> str:
         provider = job.provider or "unknown"
         model = job.model_id or "unknown"
+        if provider == "xyq_nest":
+            provider = video_provider_display(provider, model)
         return f"{provider}/{model}"
 
+    def _rate_limit_delays(self, job: GenerationJob) -> tuple[int, ...]:
+        if (job.provider or "") == "xyq_nest" or normalize_video_model(job.model_id) == "小云雀":
+            return XYQ_RATE_LIMIT_BACKOFF_SECONDS
+        return RATE_LIMIT_BACKOFF_SECONDS
+
     def _delay_label(self, delay_seconds: int) -> str:
-        mapping = {60: "1 分钟", 300: "5 分钟", 1200: "20 分钟"}
+        mapping = {60: "1 分钟", 300: "5 分钟", 600: "10 分钟", 1200: "20 分钟", 1800: "30 分钟", 3600: "1 小时"}
         return mapping.get(delay_seconds, f"{delay_seconds} 秒")
 
     def _now_label(self) -> str:
@@ -576,8 +586,8 @@ class WorkflowService:
             return {
                 "dashscope": settings.dashscope_image_model,
                 "openai": settings.openai_image_model,
-                "nano_banana_2": settings.nano_banana_model,
-                "openrouter": settings.openrouter_image_model,
+                "nano_banana_2": IMAGE_MODEL_NEOBUNANA,
+                "openrouter": IMAGE_MODEL_NEOBUNANA,
             }.get(selected, settings.dashscope_image_model)
         return {
             "dashscope": settings.dashscope_video_model,
@@ -586,21 +596,28 @@ class WorkflowService:
         }.get(selected, settings.dashscope_video_model)
 
     def _infer_provider(self, *, kind: str, provider: str, model_id: str) -> str:
+        if kind == "image":
+            model_id = normalize_image_model(model_id)
+        elif kind == "video":
+            model_id = normalize_video_model(model_id)
         normalized = model_id.lower().replace("-", "_").replace("/", "_")
         inferred = None
         if normalized in {"mock", "mock_text", "mock_image", "mock_video"}:
             inferred = "mock"
-        elif normalized in {"nano_banana_2", "gemini_3.1_flash_image_preview"}:
-            inferred = "nano_banana_2" if settings.google_api_key else "openrouter"
+        elif normalized in {"neobunana", "nano_banana_2", "gemini_3.1_flash_image_preview"}:
+            if settings.openrouter_api_key:
+                inferred = "openrouter"
+            elif settings.google_api_key:
+                inferred = "nano_banana_2"
         elif normalized.startswith("deepseek_v4") or normalized.startswith("deepseek_chat") or normalized.startswith("deepseek_reasoner"):
             inferred = "deepseek"
-        elif normalized in {"gpt_image_2", "gpt_image_1"}:
-            inferred = "openai"
+        elif normalized in {"gpt2", "gpt_image_2", "gpt_image_1", "openai_gpt_5.4_image_2"}:
+            inferred = "openrouter" if settings.openrouter_api_key else "openai"
         elif normalized.startswith(("qwen", "wan", "z_image")):
             inferred = "dashscope"
         elif normalized.startswith("seedance"):
             inferred = "seedance_2_0"
-        elif normalized.startswith(("xyq", "xiaoyunque", "xiao_yunque")):
+        elif normalized == "小云雀" or normalized.startswith(("xyq", "xiaoyunque", "xiao_yunque")):
             inferred = "xyq_nest"
         elif normalized.startswith(("google_gemini", "openai_gpt", "anthropic_", "x_ai_", "meta_llama", "mistralai_", "moonshotai_")):
             inferred = "openrouter"

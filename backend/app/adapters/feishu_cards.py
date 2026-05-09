@@ -45,11 +45,11 @@ def project_overview_card(*, project_name: str, table_url: str | None, stats: di
     }
 
 
-def chatbot_reply_card(*, content: str) -> dict:
+def chatbot_reply_card(*, content: str, title: str = "AI 助手") -> dict:
     markdown = render_feishu_markdown(content)
     return {
         "config": {"wide_screen_mode": True},
-        "header": {"title": {"tag": "plain_text", "content": "AI 分镜助手"}, "template": "wathet"},
+        "header": {"title": {"tag": "plain_text", "content": title}, "template": "wathet"},
         "elements": [{"tag": "markdown", "content": markdown}],
     }
 
@@ -175,19 +175,44 @@ def help_card() -> dict:
             "**常用命令**",
             "",
             "- 直接聊天：不加 `/` 时，机器人会按普通 AI 助手回复",
+            "- `/普通助手`：把当前会话切回普通对话助手",
+            "- `/分镜助手`：把当前会话切到分镜工作流助手",
+            "- `/Deep Research`：把当前会话切到深度研究模式，后续会联网检索并把研究结果保存为飞书文档",
             "- `/help` / `/帮助` / `/菜单`：查看这张说明卡片",
+            "- `/New session`：重置当前群聊或私聊会话的聊天记录，不影响项目和模型设置",
             "- `/新建分镜项目：项目名`：创建分镜表和项目文件夹",
+            "- `/新建分镜项目：项目名 https://xxx.feishu.cn/drive/folder/FILE_TOKEN`：在指定飞书文件夹下创建项目",
             "- `/新建项目：项目名` / `/新建：项目名` / `/new：项目名`：同样创建项目",
             "- `/新建 AI 分镜项目`：创建一个未命名项目，后续再改名",
             "- `/优化当前批次 Prompt`：优化最近项目的 batch_001",
             "- `/生成全部图片`：为最近项目所有分镜生成首帧和尾帧；关键帧需先启动关键帧生成",
             "- `/生成全部视频`：为最近项目生成视频；有首尾帧/参考图就使用，没有图片就按文字生成",
             "- `/生成全部图片和视频`：连续执行图片和视频生成",
-            "- `/启动首尾帧同步`：把所有行的 `首帧同步设置` 改为 `是`",
-            "- `/启动关键帧生成`：后续生成图片时同时生成关键帧候选图",
+            "- `/启动首尾帧同步` / `/关闭首尾帧同步`：统一切换所有行的 `首帧同步设置`，以最后一次操作为准",
+            "- `/启动关键帧生成` / `/关闭关键帧生成`：统一切换所有行的 `关键帧生成设置`，以最后一次操作为准",
             "- `/切换chatbot模型 qwen-plus`：切换普通对话模型，可选 qwen-plus / qwen-max / gpt-5.4 / deepseek-v4-pro / deepseek-v4-flash / google/gemini-3.1-pro-preview / google/gemini-3.1-flash-lite-preview",
+            "- 如果切到 OpenRouter 的 Gemini 聊天模型，chatbot 现在会按需调用联网搜索，适合问最新公开资料、新闻、公司动态和市场信息",
+            "- 如果切到 DeepSeek 聊天模型，系统也会在需要时先做公开网页搜索，再把结果提供给模型回答",
+            "- `/直接生成图片`：按命令直接调用图片模型；必填 `模型=`、`提示词=`，可选 `尺寸=`、`参考图=`",
+            "- `/直接生成视频`：按命令直接调用视频模型；必填 `模型=`、`提示词=`，可选 `时长=`、`首帧=`、`尾帧=`、`参考图=`、`关键帧=`",
             "- `/同步表格`：补齐默认值并同步分镜行",
             "- `/查看进度`：查看最近项目进度",
+            "- Deep Research 模式下如果消息里附带飞书文档/文件链接，系统会读取文档内容或文本文件内容，再结合联网结果写研究报告",
+            "",
+            "**直接生成示例**",
+            "",
+            "- `/直接生成图片`",
+            "- `模型=neobunana`",
+            "- `提示词=夕阳下的海边咖啡馆，暖光，电影感`",
+            "- `/直接生成图片`",
+            "- `模型=neobunana`",
+            "- `提示词=把这张图改成卡通海报风`",
+            "- `参考图=https://xxx.feishu.cn/file/FILE_TOKEN`",
+            "- `/直接生成视频`",
+            "- `模型=小云雀`",
+            "- `提示词=镜头缓慢推近，蒸汽自然上升`",
+            "- `首帧=https://xxx.feishu.cn/file/A`",
+            "- `尾帧=https://xxx.feishu.cn/file/B`",
             "",
             "**项目创建后常用按钮**",
             "",
@@ -196,8 +221,8 @@ def help_card() -> dict:
             "- 生成全部图片",
             "- 生成全部视频",
             "- 生成全部图片和视频",
-            "- 启动首尾帧同步",
-            "- 启动关键帧生成",
+            "- 开启/关闭首尾帧同步",
+            "- 开启/关闭关键帧生成",
             "- 查看进度",
             "",
             "**表格里最常用的状态**",
@@ -227,6 +252,8 @@ def project_created_card(
     project_name: str,
     table_url: str | None,
     folder_url: str | None = None,
+    transition_alignment_state: str = "未启动",
+    keyframe_generation_state: str = "未启动",
 ) -> dict:
     content = "\n".join(
         [
@@ -269,15 +296,29 @@ def project_created_card(
         },
         {
             "tag": "button",
-            "text": {"tag": "plain_text", "content": "启动首尾帧同步"},
+            "text": {
+                "tag": "plain_text",
+                "content": "关闭首尾帧同步" if transition_alignment_state == "已启动" else "开启首尾帧同步",
+            },
             "type": "default",
-            "value": {"action": "project.enable_transition_alignment", "project_id": project_id},
+            "value": {
+                "action": "project.set_transition_alignment",
+                "project_id": project_id,
+                "enabled": transition_alignment_state != "已启动",
+            },
         },
         {
             "tag": "button",
-            "text": {"tag": "plain_text", "content": "启动关键帧生成"},
+            "text": {
+                "tag": "plain_text",
+                "content": "关闭关键帧生成" if keyframe_generation_state == "已启动" else "开启关键帧生成",
+            },
             "type": "default",
-            "value": {"action": "project.enable_keyframes", "project_id": project_id},
+            "value": {
+                "action": "project.set_keyframes",
+                "project_id": project_id,
+                "enabled": keyframe_generation_state != "已启动",
+            },
         },
         {
             "tag": "button",
@@ -330,7 +371,7 @@ def progress_card(*, project_name: str, stats: dict, table_url: str | None = Non
             f"- 视频：{stats.get('videos', 0)} 已生成",
             f"- 视频生成：{stats.get('video_generating', 0)} 正在生成 / {stats.get('video_done', 0)} 生成完成",
             f"- 首尾帧同步：{stats.get('transition_alignment_state') or ('已启动' if stats.get('transition_alignment_enabled') else '未启动')}",
-            f"- 关键帧生成：{'已启动' if stats.get('keyframe_generation_enabled') else '未启动'}",
+            f"- 关键帧生成：{stats.get('keyframe_generation_state') or ('已启动' if stats.get('keyframe_generation_enabled') else '未启动')}",
             f"- 待生成：{stats.get('pending_frames', 0)}",
             f"- 帧生成中：{stats.get('frames_generating', 0)}",
             f"- 待审核：{stats.get('pending_review', 0)}",
@@ -366,6 +407,36 @@ def progress_card(*, project_name: str, stats: dict, table_url: str | None = Non
                         "text": {"tag": "plain_text", "content": "生成全部视频"},
                         "type": "primary",
                         "value": {"action": "project.generate_all_videos", "project_id": project_id},
+                    },
+                    {
+                        "tag": "button",
+                        "text": {
+                            "tag": "plain_text",
+                            "content": "关闭首尾帧同步"
+                            if stats.get("transition_alignment_state") == "已启动"
+                            else "开启首尾帧同步",
+                        },
+                        "type": "default",
+                        "value": {
+                            "action": "project.set_transition_alignment",
+                            "project_id": project_id,
+                            "enabled": stats.get("transition_alignment_state") != "已启动",
+                        },
+                    },
+                    {
+                        "tag": "button",
+                        "text": {
+                            "tag": "plain_text",
+                            "content": "关闭关键帧生成"
+                            if stats.get("keyframe_generation_state") == "已启动"
+                            else "开启关键帧生成",
+                        },
+                        "type": "default",
+                        "value": {
+                            "action": "project.set_keyframes",
+                            "project_id": project_id,
+                            "enabled": stats.get("keyframe_generation_state") != "已启动",
+                        },
                     },
                 ],
             },
