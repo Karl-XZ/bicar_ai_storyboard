@@ -45,7 +45,7 @@ def project_overview_card(*, project_name: str, table_url: str | None, stats: di
     }
 
 
-def chatbot_reply_card(*, content: str, title: str = "AI 助手", chat_type: str | None = None, sender_open_id: str | None = None) -> dict:
+def chatbot_reply_card(*, content: str, title: str = "哔车AI助手", chat_type: str | None = None, sender_open_id: str | None = None) -> dict:
     markdown = render_feishu_markdown(content)
     quick_action_value = {
         "chat_type": chat_type,
@@ -203,7 +203,7 @@ def help_card() -> dict:
         [
             "**常用命令**",
             "",
-            "- 直接聊天：不加 `/` 时，机器人会按普通 AI 助手回复",
+            "- 直接聊天：不加 `/` 时，机器人会按普通助手回复",
             "- `/普通助手`：把当前会话切回普通对话助手",
             "- `/分镜助手` / `/视频助手`：把当前会话切到分镜工作流助手",
             "- `/Deep Research`：把当前会话切到深度研究模式，后续会联网检索并把研究结果保存为飞书文档",

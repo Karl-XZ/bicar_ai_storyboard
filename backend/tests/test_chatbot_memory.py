@@ -98,7 +98,7 @@ def test_chatbot_reply_uses_history_and_persists_turn(monkeypatch):
     assert captured["model"] == "qwen-plus"
     messages = captured["messages"]
     assert isinstance(messages, list)
-    assert "通用中文 AI 助手" in messages[0]["content"]
+    assert "哔车AI助手" in messages[0]["content"]
     assert "当前绑定项目：群聊项目" in messages[0]["content"]
     assert "最近一次模型 smoke test 时间：2026-05-09" in messages[0]["content"]
     assert "小云雀 已正式接入当前项目" in messages[0]["content"]
@@ -148,7 +148,7 @@ def test_handle_bot_text_sends_normal_chat_as_markdown_card(monkeypatch):
     assert result == {"message": "chatbot 已回复", "data": {"chat_id": "oc_group"}}
     assert sent["receive_id"] == "oc_group"
     assert sent["receive_id_type"] == "chat_id"
-    assert sent["card"]["header"]["title"]["content"] == "AI 助手"
+    assert sent["card"]["header"]["title"]["content"] == "哔车AI助手"
     assert sent["card"]["elements"][0]["tag"] == "markdown"
     assert "**回复重点**" in sent["card"]["elements"][0]["content"]
     assert sent["card"]["elements"][1]["actions"][0]["text"]["content"] == "/New Session"
@@ -354,6 +354,9 @@ def test_openrouter_chat_includes_web_search_tool_when_enabled(monkeypatch):
 
 def test_chatbot_reply_uses_deep_research_mode(monkeypatch):
     db = make_db()
+    project = ProjectService(db).create_project(CreateProjectRequest(name="不应注入的项目"))
+    project.feishu_app_token = "app_001"
+    project.workflow_config = {**(project.workflow_config or {}), "chat_id": "oc_group"}
     ChatPreferenceService(db).set_assistant_mode(
         chat_id="oc_group",
         chat_type="group",
@@ -386,6 +389,8 @@ def test_chatbot_reply_uses_deep_research_mode(monkeypatch):
     assert captured["query"] == "请研究 e.go 的发展历程"
     assert captured["active_model"] == "deepseek-v4-pro"
     assert "Deep Research" in captured["messages"][0]["content"]
+    assert "当前绑定项目" not in captured["messages"][0]["content"]
+    assert "不应注入的项目" not in captured["messages"][0]["content"]
     assert (
         ChatPreferenceService(db).get_assistant_mode(
             chat_id="oc_group",
@@ -684,6 +689,32 @@ def test_format_google_interaction_response_reads_latest_text_step():
     }
 
     assert bot_commands._format_google_interaction_response(payload) == "# 最终研究报告"
+
+
+def test_format_google_interaction_response_prefers_outputs_over_steps():
+    payload = {
+        "status": "completed",
+        "outputs": [{"text": "# 完整研究报告\n\n这里是正文"}],
+        "steps": [
+            {"content": [{"type": "text", "text": "**Sources:**\n1. https://example.com"}]},
+        ],
+    }
+
+    assert bot_commands._format_google_interaction_response(payload) == "# 完整研究报告\n\n这里是正文"
+
+
+def test_deep_research_prompt_does_not_include_project_context():
+    db = make_db()
+    project = ProjectService(db).create_project(CreateProjectRequest(name="项目上下文不应出现"))
+
+    prompt = bot_commands._deep_research_prompt(
+        query="研究 e.go 公司",
+        references=[],
+        project=project,
+    )
+
+    assert "项目上下文不应出现" not in prompt
+    assert "当前飞书项目" not in prompt
 
 
 def test_chatbot_reply_injects_search_context_for_deepseek(monkeypatch):

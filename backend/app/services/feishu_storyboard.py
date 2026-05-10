@@ -619,8 +619,11 @@ class FeishuStoryboardService:
             return False
 
     async def _provision_feishu_resources(self, project: Project, *, parent_folder_url: str | None = None) -> dict:
-        parent_folder_token = self._folder_token_from_url(parent_folder_url) or settings.feishu_root_folder_token or "root"
         workspace = FeishuWorkspaceService(feishu=self.feishu)
+        parent_folder_token = self._folder_token_from_url(parent_folder_url)
+        if not parent_folder_token:
+            ensured_parent = await workspace.ensure_storyboard_workspace_folder()
+            parent_folder_token = str(ensured_parent.get("folder_token") or settings.feishu_root_folder_token or "root")
         project_folder, resolved_parent = await workspace.create_folder_with_fallback(
             parent_token=parent_folder_token,
             name=project.name,

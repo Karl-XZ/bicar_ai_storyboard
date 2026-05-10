@@ -122,7 +122,7 @@ def test_direct_video_command_parses_frames_and_duration():
 
 def test_chatbot_reply_card_uses_markdown_block():
     card = chatbot_reply_card(content="**重点**\n- 第一条\n```python\nprint(1)\n```", chat_type="group", sender_open_id="ou_alice")
-    assert card["header"]["title"]["content"] == "AI 助手"
+    assert card["header"]["title"]["content"] == "哔车AI助手"
     assert card["elements"][0]["tag"] == "markdown"
     assert "**重点**" in card["elements"][0]["content"]
     assert card["elements"][1]["tag"] == "action"

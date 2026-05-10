@@ -33,7 +33,9 @@ class Settings(BaseSettings):
     feishu_default_chat_id: str = ""
     feishu_root_folder_token: str = "root"
     feishu_workspace_parent_url: str = "https://ocnwptzvwvt6.feishu.cn/drive/folder/TcAUfNw3nlk8eTdrPWxc0kK3nJe"
-    feishu_workspace_folder_name: str = "AI分镜"
+    feishu_workspace_folder_name: str = "AI生成"
+    feishu_workspace_storyboard_folder_name: str = "分镜项目"
+    feishu_workspace_deep_research_folder_name: str = "Deep Research"
 
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com"

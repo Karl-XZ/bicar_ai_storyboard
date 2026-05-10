@@ -3,11 +3,19 @@ from __future__ import annotations
 import io
 import json
 import re
-import zipfile
 from dataclasses import dataclass
 from pathlib import Path
 from urllib.parse import urlparse
 from xml.sax.saxutils import escape
+
+import markdown as markdown_lib
+from bs4 import BeautifulSoup, NavigableString, Tag
+from docx import Document
+from docx.enum.table import WD_TABLE_ALIGNMENT
+from docx.opc.constants import RELATIONSHIP_TYPE as RT
+from docx.oxml import OxmlElement
+from docx.oxml.ns import qn
+from docx.shared import Pt
 
 from app.adapters.feishu import FeishuClient, FeishuApiError
 from app.core.config import settings
@@ -52,6 +60,23 @@ class FeishuWorkspaceService:
                 "moved_items": 0,
             }
 
+    async def ensure_storyboard_workspace_folder(self) -> dict[str, str | int]:
+        return await self.ensure_workspace_subfolder(settings.feishu_workspace_storyboard_folder_name)
+
+    async def ensure_deep_research_workspace_folder(self) -> dict[str, str | int]:
+        return await self.ensure_workspace_subfolder(settings.feishu_workspace_deep_research_folder_name)
+
+    async def ensure_workspace_subfolder(self, name: str) -> dict[str, str | int]:
+        root = await self.ensure_default_workspace_folder()
+        parent_token = str(root.get("folder_token") or settings.feishu_root_folder_token or "root")
+        folder = await self.ensure_named_folder(parent_token=parent_token, name=name)
+        folder_token = self._extract_token(folder)
+        return {
+            "folder_token": folder_token,
+            "folder_url": self._extract_url(folder) or self._drive_folder_url(folder_token),
+            "moved_items": 0,
+        }
+
     async def ensure_named_folder(self, *, parent_token: str, name: str) -> dict:
         page_token: str | None = None
         while True:
@@ -91,7 +116,10 @@ class FeishuWorkspaceService:
         return moved
 
     async def save_markdown_document(self, *, title: str, markdown: str, folder_token: str | None = None) -> FeishuDocumentResult:
-        target_folder = folder_token or settings.feishu_root_folder_token or "root"
+        target_folder = folder_token
+        if not target_folder:
+            ensured = await self.ensure_deep_research_workspace_folder()
+            target_folder = str(ensured.get("folder_token") or settings.feishu_root_folder_token or "root")
         filename = f"{title}.docx"
         content = self._render_markdown_docx(title=title, markdown=markdown)
         upload, resolved_folder = await self.upload_file_with_fallback(target_folder=target_folder, name=filename, content=content)
@@ -263,20 +291,183 @@ class FeishuWorkspaceService:
         return f"[binary file omitted] mime_type={mime_type} filename={filename} bytes={len(content)}"
 
     def _render_markdown_docx(self, *, title: str, markdown: str) -> bytes:
-        body_paragraphs, hyperlinks = self._markdown_to_docx_paragraphs(markdown)
-        document_xml = self._build_document_xml(title=title, body_paragraphs=body_paragraphs)
-        core_xml = self._build_core_xml(title=title)
+        html = markdown_lib.markdown(
+            markdown or "",
+            extensions=[
+                "tables",
+                "fenced_code",
+                "sane_lists",
+                "nl2br",
+            ],
+        )
+        soup = BeautifulSoup(html, "html.parser")
+        document = Document()
+        document.add_heading(title, level=0)
+        self._configure_document_styles(document)
+        for node in soup.contents:
+            self._append_block(document, node)
+        if not soup.contents:
+            document.add_paragraph("")
         buffer = io.BytesIO()
-        with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as archive:
-            archive.writestr("[Content_Types].xml", self._content_types_xml())
-            archive.writestr("_rels/.rels", self._root_relationships_xml())
-            archive.writestr("docProps/core.xml", core_xml)
-            archive.writestr("docProps/app.xml", self._app_xml())
-            archive.writestr("word/document.xml", document_xml)
-            archive.writestr("word/styles.xml", self._styles_xml())
-            archive.writestr("word/numbering.xml", self._numbering_xml())
-            archive.writestr("word/_rels/document.xml.rels", self._document_relationships_xml(hyperlinks))
+        document.save(buffer)
         return buffer.getvalue()
+
+    def _configure_document_styles(self, document: Document) -> None:
+        styles = document.styles
+        if "Normal" in styles:
+            styles["Normal"].font.size = Pt(11)
+        if "Heading 1" in styles:
+            styles["Heading 1"].font.size = Pt(18)
+        if "Heading 2" in styles:
+            styles["Heading 2"].font.size = Pt(15)
+        if "Heading 3" in styles:
+            styles["Heading 3"].font.size = Pt(13)
+
+    def _append_block(self, document: Document, node: Tag | NavigableString) -> None:
+        if isinstance(node, NavigableString):
+            text = str(node).strip()
+            if text:
+                document.add_paragraph(text)
+            return
+        if not isinstance(node, Tag):
+            return
+        if node.name in {"h1", "h2", "h3", "h4", "h5", "h6"}:
+            level = min(int(node.name[1]), 4)
+            paragraph = document.add_heading(level=level)
+            self._append_inline(paragraph, node)
+            return
+        if node.name == "p":
+            paragraph = document.add_paragraph()
+            self._append_inline(paragraph, node)
+            return
+        if node.name in {"ul", "ol"}:
+            self._append_list(document, node, ordered=node.name == "ol", level=0)
+            return
+        if node.name == "pre":
+            paragraph = document.add_paragraph()
+            run = paragraph.add_run(node.get_text("\n"))
+            run.font.name = "Courier New"
+            run.font.size = Pt(10)
+            return
+        if node.name == "blockquote":
+            paragraph = document.add_paragraph(style="Intense Quote" if "Intense Quote" in document.styles else None)
+            self._append_inline(paragraph, node)
+            return
+        if node.name == "table":
+            self._append_table(document, node)
+            return
+        if node.name == "hr":
+            document.add_paragraph("----------------------------------------")
+            return
+        paragraph = document.add_paragraph()
+        self._append_inline(paragraph, node)
+
+    def _append_list(self, document: Document, list_tag: Tag, *, ordered: bool, level: int) -> None:
+        style = "List Number" if ordered else "List Bullet"
+        nested_style = "List Number 2" if ordered else "List Bullet 2"
+        for item in list_tag.find_all("li", recursive=False):
+            paragraph = document.add_paragraph(style=nested_style if level > 0 and nested_style in document.styles else style)
+            for child in item.contents:
+                if isinstance(child, Tag) and child.name in {"ul", "ol"}:
+                    continue
+                self._append_inline(paragraph, child)
+            for child in item.find_all(["ul", "ol"], recursive=False):
+                self._append_list(document, child, ordered=child.name == "ol", level=level + 1)
+
+    def _append_table(self, document: Document, table_tag: Tag) -> None:
+        rows = table_tag.find_all("tr")
+        if not rows:
+            return
+        max_cols = max(len(row.find_all(["th", "td"], recursive=False)) for row in rows)
+        table = document.add_table(rows=len(rows), cols=max_cols)
+        table.alignment = WD_TABLE_ALIGNMENT.CENTER
+        table.style = "Table Grid"
+        for row_index, row in enumerate(rows):
+            cells = row.find_all(["th", "td"], recursive=False)
+            for cell_index, cell_tag in enumerate(cells):
+                cell = table.cell(row_index, cell_index)
+                paragraph = cell.paragraphs[0]
+                self._clear_paragraph(paragraph)
+                self._append_inline(paragraph, cell_tag)
+                if cell_tag.name == "th":
+                    for run in paragraph.runs:
+                        run.bold = True
+
+    def _append_inline(self, paragraph, node: Tag | NavigableString, *, bold: bool = False, italic: bool = False, code: bool = False) -> None:
+        if isinstance(node, NavigableString):
+            text = str(node)
+            if text:
+                run = paragraph.add_run(text)
+                run.bold = bold
+                run.italic = italic
+                if code:
+                    run.font.name = "Courier New"
+                    run.font.size = Pt(10)
+            return
+        if not isinstance(node, Tag):
+            return
+        name = node.name.lower()
+        if name == "br":
+            paragraph.add_run("\n")
+            return
+        if name in {"strong", "b"}:
+            for child in node.contents:
+                self._append_inline(paragraph, child, bold=True or bold, italic=italic, code=code)
+            return
+        if name in {"em", "i"}:
+            for child in node.contents:
+                self._append_inline(paragraph, child, bold=bold, italic=True or italic, code=code)
+            return
+        if name == "code":
+            for child in node.contents:
+                self._append_inline(paragraph, child, bold=bold, italic=italic, code=True)
+            return
+        if name == "a":
+            self._add_hyperlink(paragraph, node.get("href", ""), node.get_text(strip=False), bold=bold, italic=italic, code=code)
+            return
+        for child in node.contents:
+            self._append_inline(paragraph, child, bold=bold, italic=italic, code=code)
+
+    def _add_hyperlink(self, paragraph, url: str, text: str, *, bold: bool = False, italic: bool = False, code: bool = False) -> None:
+        if not url:
+            run = paragraph.add_run(text)
+            run.bold = bold
+            run.italic = italic
+            return
+        part = paragraph.part
+        rel_id = part.relate_to(url, RT.HYPERLINK, is_external=True)
+        hyperlink = OxmlElement("w:hyperlink")
+        hyperlink.set(qn("r:id"), rel_id)
+        run_element = OxmlElement("w:r")
+        run_pr = OxmlElement("w:rPr")
+        color = OxmlElement("w:color")
+        color.set(qn("w:val"), "0563C1")
+        underline = OxmlElement("w:u")
+        underline.set(qn("w:val"), "single")
+        run_pr.append(color)
+        run_pr.append(underline)
+        if bold:
+            run_pr.append(OxmlElement("w:b"))
+        if italic:
+            run_pr.append(OxmlElement("w:i"))
+        if code:
+            fonts = OxmlElement("w:rFonts")
+            fonts.set(qn("w:ascii"), "Courier New")
+            fonts.set(qn("w:hAnsi"), "Courier New")
+            run_pr.append(fonts)
+        run_element.append(run_pr)
+        text_element = OxmlElement("w:t")
+        if text.startswith(" ") or text.endswith(" "):
+            text_element.set(qn("xml:space"), "preserve")
+        text_element.text = text
+        run_element.append(text_element)
+        hyperlink.append(run_element)
+        paragraph._p.append(hyperlink)
+
+    def _clear_paragraph(self, paragraph) -> None:
+        element = paragraph._element
+        for child in list(element):
+            element.remove(child)
 
     def _build_document_xml(self, *, title: str, body_paragraphs: list[str]) -> str:
         title_paragraph, _ = self._docx_paragraph(title, style="Title")

@@ -18,7 +18,18 @@ class FakeFeishuClient:
                 "code": 0,
                 "data": {
                     "files": [
-                        {"name": "AI分镜", "token": "new_root", "type": "folder", "url": "https://feishu.test/drive/folder/new_root"}
+                        {"name": "AI生成", "token": "new_root", "type": "folder", "url": "https://feishu.test/drive/folder/new_root"}
+                    ],
+                    "has_more": False,
+                },
+            }
+        if folder_token == "new_root":
+            return {
+                "code": 0,
+                "data": {
+                    "files": [
+                        {"name": "Deep Research", "token": "deep_research", "type": "folder", "url": "https://feishu.test/drive/folder/deep_research"},
+                        {"name": "分镜项目", "token": "storyboards", "type": "folder", "url": "https://feishu.test/drive/folder/storyboards"},
                     ],
                     "has_more": False,
                 },
@@ -41,7 +52,12 @@ class FakeFeishuClient:
         return {"code": 0, "data": {}}
 
     async def create_folder(self, parent_token: str, name: str) -> dict:
-        return {"code": 0, "data": {"token": "new_root", "url": "https://feishu.test/drive/folder/new_root"}}
+        token = {
+            "AI生成": "new_root",
+            "Deep Research": "deep_research",
+            "分镜项目": "storyboards",
+        }.get(name, "created_folder")
+        return {"code": 0, "data": {"token": token, "url": f"https://feishu.test/drive/folder/{token}"}}
 
     async def upload_file(self, folder_token: str, name: str, content: bytes) -> dict:
         self.uploads.append((folder_token, name, content))
@@ -56,7 +72,7 @@ class FakeFeishuClient:
 
 def test_workspace_service_migrates_old_root_into_new_ai_folder(monkeypatch):
     monkeypatch.setattr(settings, "feishu_workspace_parent_url", "https://feishu.test/drive/folder/parent_folder")
-    monkeypatch.setattr(settings, "feishu_workspace_folder_name", "AI分镜")
+    monkeypatch.setattr(settings, "feishu_workspace_folder_name", "AI生成")
     monkeypatch.setattr(settings, "feishu_root_folder_token", "old_root")
     service = FeishuWorkspaceService(feishu=FakeFeishuClient())
 
@@ -68,17 +84,20 @@ def test_workspace_service_migrates_old_root_into_new_ai_folder(monkeypatch):
 
 
 def test_workspace_service_saves_markdown_doc(monkeypatch):
-    monkeypatch.setattr(settings, "feishu_root_folder_token", "new_root")
+    monkeypatch.setattr(settings, "feishu_root_folder_token", "old_root")
+    monkeypatch.setattr(settings, "feishu_workspace_parent_url", "https://feishu.test/drive/folder/parent_folder")
+    monkeypatch.setattr(settings, "feishu_workspace_folder_name", "AI生成")
+    monkeypatch.setattr(settings, "feishu_workspace_deep_research_folder_name", "Deep Research")
     fake = FakeFeishuClient()
     service = FeishuWorkspaceService(feishu=fake)
 
     result = asyncio.run(service.save_markdown_document(title="报告", markdown="# 报告\n内容 [来源](https://example.com)"))
 
     assert result.document_id == "file_123"
-    assert result.folder_token == "new_root"
+    assert result.folder_token == "deep_research"
     assert result.url.endswith("/file/file_123")
-    assert fake.moves == []
-    assert fake.uploads[0][0] == "new_root"
+    assert fake.moves == [("doc_1", "new_root", "docx"), ("sheet_1", "new_root", "sheet")]
+    assert fake.uploads[0][0] == "deep_research"
     assert fake.uploads[0][1].endswith(".docx")
     with zipfile.ZipFile(io.BytesIO(fake.uploads[0][2])) as archive:
         assert "word/document.xml" in archive.namelist()
@@ -91,7 +110,10 @@ def test_workspace_service_saves_markdown_doc(monkeypatch):
 
 
 def test_workspace_service_renders_real_links_and_lists(monkeypatch):
-    monkeypatch.setattr(settings, "feishu_root_folder_token", "new_root")
+    monkeypatch.setattr(settings, "feishu_root_folder_token", "old_root")
+    monkeypatch.setattr(settings, "feishu_workspace_parent_url", "https://feishu.test/drive/folder/parent_folder")
+    monkeypatch.setattr(settings, "feishu_workspace_folder_name", "AI生成")
+    monkeypatch.setattr(settings, "feishu_workspace_deep_research_folder_name", "Deep Research")
     fake = FakeFeishuClient()
     service = FeishuWorkspaceService(feishu=fake)
     markdown = "\n".join(
@@ -111,14 +133,43 @@ def test_workspace_service_renders_real_links_and_lists(monkeypatch):
         rels_xml = archive.read("word/_rels/document.xml.rels").decode("utf-8")
         numbering_xml = archive.read("word/numbering.xml").decode("utf-8")
         assert "<w:hyperlink " in document_xml
-        assert "<w:numPr>" in document_xml
+        assert "第一条" in document_xml
+        assert "编号二" in document_xml
         assert 'Target="https://example.com/a"' in rels_xml
         assert 'w:numFmt w:val="bullet"' in numbering_xml
         assert 'w:numFmt w:val="decimal"' in numbering_xml
 
 
+def test_workspace_service_renders_markdown_tables(monkeypatch):
+    monkeypatch.setattr(settings, "feishu_root_folder_token", "old_root")
+    monkeypatch.setattr(settings, "feishu_workspace_parent_url", "https://feishu.test/drive/folder/parent_folder")
+    monkeypatch.setattr(settings, "feishu_workspace_folder_name", "AI生成")
+    monkeypatch.setattr(settings, "feishu_workspace_deep_research_folder_name", "Deep Research")
+    fake = FakeFeishuClient()
+    service = FeishuWorkspaceService(feishu=fake)
+    markdown = "\n".join(
+        [
+            "| 模块 | 状态 |",
+            "| --- | --- |",
+            "| 公司时间线 | 完成 |",
+            "| 融资历史 | 待补充 |",
+        ]
+    )
+
+    asyncio.run(service.save_markdown_document(title="表格测试", markdown=markdown))
+
+    with zipfile.ZipFile(io.BytesIO(fake.uploads[0][2])) as archive:
+        document_xml = archive.read("word/document.xml").decode("utf-8")
+        assert "<w:tbl>" in document_xml
+        assert "公司时间线" in document_xml
+        assert "待补充" in document_xml
+
+
 def test_workspace_service_renders_large_markdown_as_docx(monkeypatch):
-    monkeypatch.setattr(settings, "feishu_root_folder_token", "new_root")
+    monkeypatch.setattr(settings, "feishu_root_folder_token", "old_root")
+    monkeypatch.setattr(settings, "feishu_workspace_parent_url", "https://feishu.test/drive/folder/parent_folder")
+    monkeypatch.setattr(settings, "feishu_workspace_folder_name", "AI生成")
+    monkeypatch.setattr(settings, "feishu_workspace_deep_research_folder_name", "Deep Research")
     fake = FakeFeishuClient()
     service = FeishuWorkspaceService(feishu=fake)
     markdown = "\n".join(f"- 第 {index} 行" for index in range(1, 70))
@@ -146,7 +197,7 @@ def test_workspace_service_reads_doc_and_file_sources():
 
 def test_workspace_service_uploads_to_default_workspace_when_target_folder_is_missing(monkeypatch):
     monkeypatch.setattr(settings, "feishu_workspace_parent_url", "https://feishu.test/drive/folder/parent_folder")
-    monkeypatch.setattr(settings, "feishu_workspace_folder_name", "AI分镜")
+    monkeypatch.setattr(settings, "feishu_workspace_folder_name", "AI生成")
     fake = FakeFeishuClient()
 
     async def failing_upload(folder_token: str, name: str, content: bytes) -> dict:

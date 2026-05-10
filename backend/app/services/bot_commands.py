@@ -407,10 +407,10 @@ def _assistant_mode_label(mode: str) -> str:
 
 def _assistant_card_title(mode: str) -> str:
     return {
-        ASSISTANT_MODE_CHAT: "AI 助手",
-        ASSISTANT_MODE_STORYBOARD: "AI 分镜助手",
-        ASSISTANT_MODE_DEEP_RESEARCH: "Deep Research 助手",
-    }.get(mode, "AI 助手")
+        ASSISTANT_MODE_CHAT: "哔车AI助手",
+        ASSISTANT_MODE_STORYBOARD: "哔车AI助手 · 分镜",
+        ASSISTANT_MODE_DEEP_RESEARCH: "哔车AI助手 · Deep Research",
+    }.get(mode, "哔车AI助手")
 
 
 def _default_chatbot_text_model() -> str:
@@ -606,7 +606,7 @@ async def _chatbot_reply(
 
     if assistant_mode == ASSISTANT_MODE_DEEP_RESEARCH:
         reply = await _deep_research_reply(
-            project=project,
+            project=None,
             query=normalized_text,
             messages=messages,
             active_model=model,
@@ -990,9 +990,18 @@ def _chatbot_system_prompt(*, project: Project | None, session_type: str, active
             "除此之外，要明确说明你无法自行联网，只能基于已有上下文给建议。"
         )
     )
+    if assistant_mode == ASSISTANT_MODE_DEEP_RESEARCH:
+        return (
+            "你现在处于 Deep Research 助手模式。"
+            "你的职责是围绕用户给定主题执行深度研究、整理公开资料、读取用户提供的飞书文档或文件、输出结构化中文研究报告或研究计划。"
+            "不要把当前对话当成飞书分镜项目的一部分，也不要主动提及项目、镜号、图片/视频工作流，除非用户明确要求把研究结果转成分镜。"
+            f"{web_search_summary}\n"
+            "回答要求：中文优先，尽量结构化；事实不确定时明确标注“待验证”；最终重点是完整研究内容，而不是只返回来源列表。"
+            f"\n{session_summary}"
+        )
     if assistant_mode == ASSISTANT_MODE_STORYBOARD:
         return (
-            "你是飞书里的分镜助手，服务于“飞书 AI 分镜 -> 图片/视频生成”工作流。\n"
+            "你是哔车AI助手的分镜模式，服务于“飞书 AI 分镜 -> 图片/视频生成”工作流。\n"
             "你的职责：解释项目规则、字段含义、状态流转、报错原因；回答工作流问题；帮助用户优化分镜描述、Prompt、镜头运动和模型选择；给出下一步建议。\n"
             "你的边界：你不能直接代替用户执行项目操作，不能假装已经新建项目、优化 Prompt、生成图片、生成视频、同步表格、切换模型或修改飞书数据。"
             "当用户希望执行这些操作时，你必须明确告诉他使用对应的斜杠命令，而不是声称你已经做了。\n"
@@ -1014,7 +1023,7 @@ def _chatbot_system_prompt(*, project: Project | None, session_type: str, active
         )
 
     return (
-        "你是一个通用中文 AI 助手，默认以普通对话助手身份服务。"
+        "你是哔车AI助手，默认以普通对话助手身份服务。"
         "你可以聊天、解释概念、帮用户梳理方案、写提纲、给建议，也可以在需要公开资料时结合联网搜索结果回答。"
         "如果用户明确要做深度研究，可以提醒他发送 `/Deep Research`；如果用户明确要进入分镜工作流，可以提醒他发送 `/分镜助手` 或 `/视频助手`。\n"
         "当用户要执行飞书分镜相关操作时，不要假装已经操作成功，要明确提示对应斜杠命令。"
@@ -1261,12 +1270,6 @@ def _format_research_error(label: str, exc: Exception) -> str:
 
 
 def _deep_research_prompt(*, query: str, references: list[dict], project: Project | None) -> str:
-    project_context = ""
-    if project:
-        project_context = (
-            f"当前飞书项目：{project.name}。\n"
-            f"如有必要，可以把研究结果往分镜脚本、视觉 Prompt、品牌叙事结构方向延展。\n"
-        )
     return (
         "你是一个专业研究分析师。请围绕用户问题执行 deep research，并输出一份中文 Markdown 报告。\n"
         "要求：\n"
@@ -1275,7 +1278,6 @@ def _deep_research_prompt(*, query: str, references: list[dict], project: Projec
         "3. 如果资料不足，要明确写“待验证”。\n"
         "4. 在文末给出来源清单，尽量保留可点击链接。\n"
         "5. 如果用户的问题更像研究计划而不是最终结论，请输出可执行的 deep research plan。\n\n"
-        f"{project_context}"
         f"用户问题：{query}\n\n"
         f"已提供文件内容（JSON 或文本）：\n{_reference_context_block(references)}"
     )
@@ -1312,6 +1314,12 @@ def _format_google_interaction_response(data: dict) -> str:
 
 
 def _extract_google_interaction_text(data: dict) -> str:
+    outputs = data.get("outputs") or []
+    if outputs:
+        last_output = outputs[-1] or {}
+        text = str(last_output.get("text") or "").strip()
+        if text:
+            return text
     for step in reversed(data.get("steps") or []):
         for content in step.get("content") or []:
             if not isinstance(content, dict):
@@ -1320,10 +1328,6 @@ def _extract_google_interaction_text(data: dict) -> str:
                 text = str(content.get("text") or "").strip()
                 if text:
                     return text
-    for output in reversed(data.get("outputs") or []):
-        text = str(output.get("text") or "").strip()
-        if text:
-            return text
     return ""
 
 

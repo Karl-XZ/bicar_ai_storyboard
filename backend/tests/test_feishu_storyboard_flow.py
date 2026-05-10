@@ -57,7 +57,18 @@ class FakeFeishuClient:
                 "code": 0,
                 "data": {
                     "files": [
-                        {"name": "AI分镜", "token": "new_root", "type": "folder", "url": "https://feishu.test/drive/folder/new_root"}
+                        {"name": "AI生成", "token": "new_root", "type": "folder", "url": "https://feishu.test/drive/folder/new_root"}
+                    ],
+                    "has_more": False,
+                },
+            }
+        if folder_token == "new_root":
+            return {
+                "code": 0,
+                "data": {
+                    "files": [
+                        {"name": "Deep Research", "token": "deep_research", "type": "folder", "url": "https://feishu.test/drive/folder/deep_research"},
+                        {"name": "分镜项目", "token": "storyboards", "type": "folder", "url": "https://feishu.test/drive/folder/storyboards"},
                     ],
                     "has_more": False,
                 },
@@ -474,7 +485,7 @@ def test_upload_drive_asset_falls_back_to_default_workspace_when_project_folder_
         monkeypatch.setattr(settings, "default_image_provider", "mock")
         monkeypatch.setattr(settings, "default_video_provider", "mock")
         monkeypatch.setattr(settings, "feishu_workspace_parent_url", "https://feishu.test/drive/folder/parent_folder")
-        monkeypatch.setattr(settings, "feishu_workspace_folder_name", "AI分镜")
+        monkeypatch.setattr(settings, "feishu_workspace_folder_name", "AI生成")
         db = make_db()
         fake = FakeFeishuClient()
 
