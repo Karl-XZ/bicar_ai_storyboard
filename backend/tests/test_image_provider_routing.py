@@ -12,6 +12,7 @@ def test_image_provider_prefers_openrouter_for_compat_aliases(monkeypatch):
     router = ProviderRouter()
 
     assert isinstance(router.image("gpt_image_2"), OpenRouterImageProvider)
+    assert isinstance(router.image("nanobanana"), OpenRouterImageProvider)
     assert isinstance(router.image("nano_banana_2"), OpenRouterImageProvider)
 
 
@@ -22,5 +23,6 @@ def test_workflow_infers_openrouter_for_supported_image_aliases(monkeypatch):
 
     workflow = WorkflowService(db=None)
 
+    assert workflow._infer_provider(kind="image", provider="auto", model_id="nanobanana") == "openrouter"
     assert workflow._infer_provider(kind="image", provider="auto", model_id="gpt_image_2") == "openrouter"
     assert workflow._infer_provider(kind="image", provider="auto", model_id="nano_banana_2") == "openrouter"

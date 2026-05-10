@@ -9,7 +9,7 @@ import httpx
 from sqlalchemy.orm import Session
 
 from app.core.config import settings
-from app.core.model_aliases import IMAGE_MODEL_NEOBUNANA, normalize_image_model, normalize_video_model, video_provider_display
+from app.core.model_aliases import IMAGE_MODEL_NANOBANANA, normalize_image_model, normalize_video_model, video_provider_display
 from app.domain.enums import AssetType, FrameType, JobStatus, JobType, Satisfaction, ShotStatus
 from app.models.asset import Asset
 from app.models.job import GenerationJob
@@ -586,8 +586,8 @@ class WorkflowService:
             return {
                 "dashscope": settings.dashscope_image_model,
                 "openai": settings.openai_image_model,
-                "nano_banana_2": IMAGE_MODEL_NEOBUNANA,
-                "openrouter": IMAGE_MODEL_NEOBUNANA,
+                "nano_banana_2": IMAGE_MODEL_NANOBANANA,
+                "openrouter": IMAGE_MODEL_NANOBANANA,
             }.get(selected, settings.dashscope_image_model)
         return {
             "dashscope": settings.dashscope_video_model,
@@ -604,7 +604,7 @@ class WorkflowService:
         inferred = None
         if normalized in {"mock", "mock_text", "mock_image", "mock_video"}:
             inferred = "mock"
-        elif normalized in {"neobunana", "nano_banana_2", "gemini_3.1_flash_image_preview"}:
+        elif normalized in {"nanobanana", "neobunana", "nano_banana_2", "gemini_3.1_flash_image_preview"}:
             if settings.openrouter_api_key:
                 inferred = "openrouter"
             elif settings.google_api_key:

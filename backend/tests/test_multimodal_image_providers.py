@@ -57,9 +57,48 @@ class FakeOpenRouterAsyncClient:
 
     async def post(self, url, headers=None, json=None):
         content = json["messages"][0]["content"]
+        assert json["model"] in {
+            "google/gemini-3.1-flash-image-preview",
+            "openai/gpt-5.4-image-2",
+        }
         assert content[0] == {"type": "text", "text": "把这张图改成赛博朋克风"}
         assert content[1]["type"] == "image_url"
         assert content[1]["image_url"]["url"].startswith("data:image/png;base64,")
+        return httpx.Response(
+            200,
+            json={
+                "choices": [
+                    {
+                        "message": {
+                            "images": [
+                                {
+                                    "image_url": {
+                                        "url": "data:image/png;base64," + base64.b64encode(b"out-image").decode("ascii")
+                                    }
+                                }
+                            ]
+                        }
+                    }
+                ]
+            },
+            request=httpx.Request("POST", url),
+        )
+
+
+class CaptureOpenRouterAsyncClient:
+    seen_models: list[str] = []
+
+    def __init__(self, *, timeout=None):
+        self.timeout = timeout
+
+    async def __aenter__(self):
+        return self
+
+    async def __aexit__(self, exc_type, exc, tb):
+        return False
+
+    async def post(self, url, headers=None, json=None):
+        CaptureOpenRouterAsyncClient.seen_models.append(json["model"])
         return httpx.Response(
             200,
             json={
@@ -111,7 +150,7 @@ def test_openrouter_provider_accepts_reference_images(monkeypatch, tmp_path):
     result = asyncio.run(
         OpenRouterImageProvider().generate_image(
             {
-                "model": "nano_banana_2",
+                "model": "nanobanana",
                 "prompt": "把这张图改成赛博朋克风",
                 "reference_images": [f"file://{reference}"],
             }
@@ -132,7 +171,7 @@ def test_openrouter_provider_maps_gpt_image_alias(monkeypatch, tmp_path):
     result = asyncio.run(
         OpenRouterImageProvider().generate_image(
             {
-                "model": "gpt_image_2",
+                "model": "gpt2",
                 "prompt": "把这张图改成赛博朋克风",
                 "reference_images": [f"file://{reference}"],
             }
@@ -141,3 +180,36 @@ def test_openrouter_provider_maps_gpt_image_alias(monkeypatch, tmp_path):
 
     assert result.bytes_data == b"out-image"
     assert result.mime_type == "image/png"
+
+
+def test_openrouter_provider_switches_to_exact_backend_model(monkeypatch, tmp_path):
+    reference = tmp_path / "reference.png"
+    reference.write_bytes(b"ref-image")
+
+    monkeypatch.setattr(settings, "openrouter_api_key", "test-openrouter-key")
+    monkeypatch.setattr("app.providers.openrouter_image.httpx.AsyncClient", CaptureOpenRouterAsyncClient)
+    CaptureOpenRouterAsyncClient.seen_models = []
+
+    asyncio.run(
+        OpenRouterImageProvider().generate_image(
+            {
+                "model": "nanobanana",
+                "prompt": "把这张图改成赛博朋克风",
+                "reference_images": [f"file://{reference}"],
+            }
+        )
+    )
+    asyncio.run(
+        OpenRouterImageProvider().generate_image(
+            {
+                "model": "gpt2",
+                "prompt": "把这张图改成赛博朋克风",
+                "reference_images": [f"file://{reference}"],
+            }
+        )
+    )
+
+    assert CaptureOpenRouterAsyncClient.seen_models == [
+        "google/gemini-3.1-flash-image-preview",
+        "openai/gpt-5.4-image-2",
+    ]

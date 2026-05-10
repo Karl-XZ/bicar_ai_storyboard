@@ -51,6 +51,7 @@ class Settings(BaseSettings):
     openrouter_base_url: str = "https://openrouter.ai/api/v1"
     openrouter_text_model: str = "google/gemini-3.1-pro-preview"
     openrouter_fast_text_model: str = "google/gemini-3.1-flash-lite-preview"
+    openrouter_deep_research_model: str = "openai/o4-mini-deep-research"
     openrouter_image_model: str = "openai/gpt-5.4-image-2"
     openrouter_nano_banana_model: str = "google/gemini-3.1-flash-image-preview"
 
@@ -72,6 +73,9 @@ class Settings(BaseSettings):
 
     google_api_key: str = ""
     google_base_url: str = "https://generativelanguage.googleapis.com"
+    google_deep_research_model: str = "deep-research-preview-04-2026"
+    google_deep_research_poll_interval_seconds: int = Field(default=10, ge=1)
+    google_deep_research_max_poll_attempts: int = Field(default=90, ge=1)
     nano_banana_model: str = "gemini-3.1-flash-image-preview"
 
     seedance_api_key: str = ""

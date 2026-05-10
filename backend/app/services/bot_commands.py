@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 import json
 import mimetypes
 import re
@@ -13,10 +14,10 @@ from urllib.parse import parse_qs, unquote, urlparse
 import httpx
 from sqlalchemy.orm import Session
 
-from app.adapters.feishu import FeishuClient
+from app.adapters.feishu import FeishuApiError, FeishuClient
 from app.adapters.feishu_cards import chatbot_reply_card, help_card
 from app.core.config import settings
-from app.core.model_aliases import IMAGE_MODEL_GPT2, IMAGE_MODEL_NEOBUNANA, VIDEO_MODEL_XYQ, normalize_image_model, normalize_video_model
+from app.core.model_aliases import IMAGE_MODEL_GPT2, IMAGE_MODEL_NANOBANANA, VIDEO_MODEL_XYQ, normalize_image_model, normalize_video_model
 from app.models.project import Project
 from app.services.chat_memory import ChatMemoryService
 from app.services.chat_preferences import ChatPreferenceService
@@ -31,7 +32,7 @@ ASSISTANT_MODE_CHAT = "chat"
 ASSISTANT_MODE_STORYBOARD = "storyboard"
 ASSISTANT_MODE_DEEP_RESEARCH = "deep_research"
 DIRECT_IMAGE_MODELS = {
-    IMAGE_MODEL_NEOBUNANA,
+    IMAGE_MODEL_NANOBANANA,
     IMAGE_MODEL_GPT2,
     "wanx2.1-t2i-turbo",
     "wanx-v1",
@@ -93,6 +94,11 @@ async def handle_bot_text(
     target_chat = chat_id or settings.feishu_default_chat_id
     feishu = FeishuClient()
     if not _is_slash_command(text):
+        current_mode = ChatPreferenceService(db).get_assistant_mode(
+            chat_id=target_chat,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+        )
         reply = await _chatbot_reply(
             db,
             text=text,
@@ -101,12 +107,15 @@ async def handle_bot_text(
             sender_open_id=sender_open_id,
         )
         if target_chat and reply:
-            mode = ChatPreferenceService(db).get_assistant_mode(
-                chat_id=target_chat,
-                chat_type=chat_type,
-                sender_open_id=sender_open_id,
+            await feishu.send_card(
+                target_chat,
+                chatbot_reply_card(
+                    content=reply,
+                    title=_assistant_card_title(current_mode),
+                    chat_type=chat_type,
+                    sender_open_id=sender_open_id,
+                ),
             )
-            await feishu.send_card(target_chat, chatbot_reply_card(content=reply, title=_assistant_card_title(mode)))
         return {"message": "chatbot 已回复", "data": {"chat_id": target_chat}}
 
     command_text = _command_text(text)
@@ -149,7 +158,15 @@ async def handle_bot_text(
             sender_open_id=sender_open_id,
         )
         if target_chat and reply:
-            await feishu.send_card(target_chat, chatbot_reply_card(content=reply, title=_assistant_card_title(mode_command.mode)))
+            await feishu.send_card(
+                target_chat,
+                chatbot_reply_card(
+                    content=reply,
+                    title=_assistant_card_title(mode_command.mode),
+                    chat_type=chat_type,
+                    sender_open_id=sender_open_id,
+                ),
+            )
         return {"message": "聊天模式已切换并回复", "data": {"mode": mode_command.mode, "chat_id": target_chat}}
 
     direct_command = _parse_direct_generation_command(command_text)
@@ -158,6 +175,8 @@ async def handle_bot_text(
             db,
             feishu=feishu,
             target_chat=target_chat,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
             command=direct_command,
         )
 
@@ -218,8 +237,38 @@ async def handle_card_action(db: Session, *, value: dict[str, Any], chat_id: str
     action = value.get("action")
     project_id = value.get("project_id")
     batch_no = value.get("batch_no") or "batch_001"
+    chat_type = value.get("chat_type")
+    sender_open_id = value.get("sender_open_id")
     service = FeishuStoryboardService(db)
-    if not action or not project_id:
+    if not action:
+        return {"message": "卡片动作已接收", "data": {"action": action}}
+
+    if action == "assistant.clear_session":
+        cleared = ChatMemoryService(
+            db,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+        ).clear()
+        db.commit()
+        if chat_id:
+            await FeishuClient().send_text(chat_id, "当前会话的聊天记录已重置。")
+        return {"message": "聊天记录已重置", "data": {"chat_id": chat_id, "cleared_messages": cleared}}
+
+    if action == "assistant.set_mode":
+        mode = str(value.get("mode") or ASSISTANT_MODE_CHAT)
+        ChatPreferenceService(db).set_assistant_mode(
+            chat_id=chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+            mode=mode,
+        )
+        db.commit()
+        if chat_id:
+            await FeishuClient().send_text(chat_id, f"当前会话已切换为：{_assistant_mode_label(mode)}")
+        return {"message": "聊天模式已切换", "data": {"chat_id": chat_id, "mode": mode}}
+
+    if not project_id:
         return {"message": "卡片动作已接收", "data": {"action": action}}
 
     project = ProjectService(db).get_project(project_id)
@@ -338,7 +387,7 @@ def _parse_assistant_mode_command(text: str) -> AssistantModeCommand | None:
     normalized = text.strip()
     patterns = [
         (r"^(?:deep\s*research|deepresearch)(?:\s*[:：]\s*|\s+)?(.*)$", ASSISTANT_MODE_DEEP_RESEARCH),
-        (r"^(?:分镜助手|ai分镜助手)(?:\s*[:：]\s*|\s+)?(.*)$", ASSISTANT_MODE_STORYBOARD),
+        (r"^(?:分镜助手|ai分镜助手|视频助手)(?:\s*[:：]\s*|\s+)?(.*)$", ASSISTANT_MODE_STORYBOARD),
         (r"^(?:普通助手|聊天助手|普通对话|chat)(?:\s*[:：]\s*|\s+)?(.*)$", ASSISTANT_MODE_CHAT),
     ]
     for pattern, mode in patterns:
@@ -362,6 +411,32 @@ def _assistant_card_title(mode: str) -> str:
         ASSISTANT_MODE_STORYBOARD: "AI 分镜助手",
         ASSISTANT_MODE_DEEP_RESEARCH: "Deep Research 助手",
     }.get(mode, "AI 助手")
+
+
+def _default_chatbot_text_model() -> str:
+    return {
+        "dashscope": settings.dashscope_text_model,
+        "openai": settings.openai_text_model,
+        "deepseek": settings.deepseek_text_model,
+        "openrouter": settings.openrouter_text_model,
+    }.get(settings.default_text_provider, settings.deepseek_text_model)
+
+
+def _default_chatbot_image_model() -> str:
+    return {
+        "dashscope": settings.dashscope_image_model,
+        "openai": settings.openai_image_model,
+        "nano_banana_2": IMAGE_MODEL_NANOBANANA,
+        "openrouter": IMAGE_MODEL_NANOBANANA,
+    }.get(settings.default_image_provider, settings.dashscope_image_model)
+
+
+def _default_chatbot_video_model() -> str:
+    return {
+        "dashscope": settings.dashscope_video_model,
+        "seedance_2_0": settings.seedance_model_id or settings.dashscope_video_model,
+        "xyq_nest": settings.xyq_video_model,
+    }.get(settings.default_video_provider, settings.dashscope_video_model)
 
 
 def _is_slash_command(text: str) -> bool:
@@ -522,7 +597,7 @@ async def _chatbot_reply(
         chat_type=chat_type,
         sender_open_id=sender_open_id,
     )
-    model = str(preferred_model or ((project.workflow_config or {}).get("chatbot_text_model") if project else None) or settings.dashscope_text_model)
+    model = str(preferred_model or ((project.workflow_config or {}).get("chatbot_text_model") if project else None) or _default_chatbot_text_model())
     memory = ChatMemoryService(db, chat_id=chat_id, chat_type=chat_type, sender_open_id=sender_open_id)
     normalized_text = text.strip()
     messages = [{"role": "system", "content": _chatbot_system_prompt(project=project, session_type=memory.session_type, active_model=model, assistant_mode=assistant_mode)}]
@@ -537,6 +612,12 @@ async def _chatbot_reply(
             active_model=model,
         )
         memory.append_turn(user_text=normalized_text, assistant_text=reply)
+        preferences.set_assistant_mode(
+            chat_id=chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+            mode=ASSISTANT_MODE_CHAT,
+        )
         db.commit()
         return reply
 
@@ -572,11 +653,20 @@ async def _handle_direct_generation_command(
     *,
     feishu: FeishuClient,
     target_chat: str | None,
+    chat_type: str | None,
+    sender_open_id: str | None,
     command: DirectGenerationCommand,
 ) -> dict[str, Any]:
     if not command.model or not command.prompt:
         if target_chat:
-            await feishu.send_card(target_chat, chatbot_reply_card(content=_direct_command_help(command.kind)))
+            await feishu.send_card(
+                target_chat,
+                chatbot_reply_card(
+                    content=_direct_command_help(command.kind),
+                    chat_type=chat_type,
+                    sender_open_id=sender_open_id,
+                ),
+            )
         return {"message": "直接生成命令缺少参数", "data": {"kind": command.kind}}
 
     project = ProjectService(db).latest_for_chat(target_chat)
@@ -592,7 +682,7 @@ async def _handle_direct_generation_command(
         return {"message": "视频模型不支持", "data": {"model": command.model}}
     if command.kind == "image" and command.reference_images and provider_name not in {"nano_banana_2", "openrouter"}:
         if target_chat:
-            await feishu.send_text(target_chat, "当前这个图片模型不支持带参考图的直接生成。图生图请优先使用 `neobunana`。")
+            await feishu.send_text(target_chat, "当前这个图片模型不支持带参考图的直接生成。图生图请优先使用 `nanobanana`。")
         return {"message": "图片模型不支持参考图", "data": {"model": command.model}}
 
     if target_chat:
@@ -618,7 +708,7 @@ async def _handle_direct_generation_command(
             )
             filename = _direct_filename(prefix="direct_image", mime_type=result.mime_type, fallback_suffix=".png")
             folder_token = _direct_output_folder(project=project, kind="image")
-            upload = await feishu.upload_file(folder_token, filename, result.bytes_data)
+            upload = await _upload_direct_output(feishu, folder_token=folder_token, filename=filename, content=result.bytes_data)
             file_token = _extract_feishu_file_token(upload)
             file_url = _feishu_file_url(file_token)
             content = "\n".join(
@@ -642,7 +732,7 @@ async def _handle_direct_generation_command(
             )
             filename = _direct_filename(prefix="direct_video", mime_type=result["mime_type"], fallback_suffix=".mp4")
             folder_token = _direct_output_folder(project=project, kind="video")
-            upload = await feishu.upload_file(folder_token, filename, result["video_bytes"])
+            upload = await _upload_direct_output(feishu, folder_token=folder_token, filename=filename, content=result["video_bytes"])
             file_token = _extract_feishu_file_token(upload)
             file_url = _feishu_file_url(file_token)
             content = "\n".join(
@@ -659,7 +749,10 @@ async def _handle_direct_generation_command(
             )
 
         if target_chat:
-            await feishu.send_card(target_chat, chatbot_reply_card(content=content))
+            await feishu.send_card(
+                target_chat,
+                chatbot_reply_card(content=content, chat_type=chat_type, sender_open_id=sender_open_id),
+            )
         return {"message": "直接生成已完成", "data": {"kind": command.kind, "model": command.model}}
     except Exception as exc:
         if target_chat:
@@ -672,7 +765,9 @@ async def _handle_direct_generation_command(
                             f"- 模型：`{command.model}`",
                             f"- 原因：`{str(exc)}`",
                         ]
-                    )
+                    ),
+                    chat_type=chat_type,
+                    sender_open_id=sender_open_id,
                 ),
             )
         return {"message": "直接生成失败", "data": {"kind": command.kind, "error": str(exc)}}
@@ -757,6 +852,25 @@ def _direct_output_folder(*, project: Project | None, kind: str) -> str:
     return str(folders.get("videos") or settings.feishu_root_folder_token)
 
 
+async def _upload_direct_output(feishu: FeishuClient, *, folder_token: str, filename: str, content: bytes) -> dict:
+    try:
+        return await feishu.upload_file(folder_token, filename, content)
+    except FeishuApiError as exc:
+        if not _is_missing_parent_folder_error(exc):
+            raise
+        workspace = FeishuWorkspaceService(feishu=feishu)
+        ensured = await workspace.ensure_default_workspace_folder()
+        fallback_token = str(ensured.get("folder_token") or settings.feishu_root_folder_token or "root")
+        if not fallback_token or fallback_token == folder_token:
+            raise
+        return await feishu.upload_file(fallback_token, filename, content)
+
+
+def _is_missing_parent_folder_error(exc: Exception) -> bool:
+    message = str(exc).lower()
+    return "parent node not exist" in message or ("parent node" in message and "not exist" in message)
+
+
 def _default_direct_image_size(project: Project | None) -> str:
     aspect_ratio = ((project.workflow_config or {}).get("aspect_ratio") if project else None) or "16:9"
     return {"16:9": "1280*720", "9:16": "720*1280", "1:1": "1024*1024"}.get(aspect_ratio, settings.dashscope_image_size)
@@ -787,11 +901,11 @@ def _direct_command_help(kind: str) -> str:
         return (
             "**直接生成图片命令格式**\n"
             "- `/直接生成图片`\n"
-            "- `模型=neobunana`\n"
+            "- `模型=nanobanana`\n"
             "- `提示词=夕阳下的海边咖啡馆`\n"
             "- 可选：`尺寸=1280*720`\n"
             "- 图生图可选：`参考图=https://xxx.feishu.cn/file/FILE_TOKEN`\n"
-            "- 图生图建议优先使用：`neobunana`"
+            "- 图生图建议优先使用：`nanobanana`"
         )
     return (
         "**直接生成视频命令格式**\n"
@@ -858,9 +972,9 @@ def _chatbot_system_prompt(*, project: Project | None, session_type: str, active
         f"时长：{workflow_config.get('duration_seconds', 5)} 秒。"
         f"关键帧生成：{'已开启' if workflow_config.get('keyframe_generation_enabled') else '未开启'}。"
         f"首尾帧同步：{'已开启' if workflow_config.get('transition_alignment_enabled') else '未开启'}。"
-        f"默认模型：文本 {((model_config.get('text') or {}).get('model_id') or settings.dashscope_text_model)}，"
-        f"图片 {((model_config.get('image') or {}).get('model_id') or settings.dashscope_image_model)}，"
-        f"视频 {((model_config.get('video') or {}).get('model_id') or settings.dashscope_video_model)}。"
+        f"默认模型：文本 {((model_config.get('text') or {}).get('model_id') or _default_chatbot_text_model())}，"
+        f"图片 {((model_config.get('image') or {}).get('model_id') or _default_chatbot_image_model())}，"
+        f"视频 {((model_config.get('video') or {}).get('model_id') or _default_chatbot_video_model())}。"
         if project
         else "当前会话还没有绑定分镜项目；如果用户要开始项目，请引导他发送 `/新建分镜项目：项目名`。"
     )
@@ -902,9 +1016,9 @@ def _chatbot_system_prompt(*, project: Project | None, session_type: str, active
     return (
         "你是一个通用中文 AI 助手，默认以普通对话助手身份服务。"
         "你可以聊天、解释概念、帮用户梳理方案、写提纲、给建议，也可以在需要公开资料时结合联网搜索结果回答。"
-        "如果用户明确要做深度研究，可以提醒他发送 `/Deep Research`；如果用户明确要进入分镜工作流，可以提醒他发送 `/分镜助手`。\n"
+        "如果用户明确要做深度研究，可以提醒他发送 `/Deep Research`；如果用户明确要进入分镜工作流，可以提醒他发送 `/分镜助手` 或 `/视频助手`。\n"
         "当用户要执行飞书分镜相关操作时，不要假装已经操作成功，要明确提示对应斜杠命令。"
-        "常用命令包括：/Deep Research、/分镜助手、/普通助手、/help、/New session、/切换chatbot模型。\n"
+        "常用命令包括：/Deep Research、/分镜助手、/视频助手、/普通助手、/help、/New session、/切换chatbot模型。\n"
         f"{web_search_summary}\n"
         "回答要求：中文优先，简洁直接，信息不确定时要说明不确定。"
         "如果问题明显和分镜项目有关，可以自然引用当前项目摘要和模型状态。\n"
@@ -922,8 +1036,10 @@ def _chatbot_capability_summary() -> str:
         "可以作为 chatbot 文本模型使用；并且在 chatbot 路径上已接入 OpenRouter web_search，适合需要联网检索公开网页资料的问答。\n"
         "OpenAI 直连文本模型 gpt-5.4 已接入，但最近一次实测返回 429 insufficient_quota / Too Many Requests，"
         "说明当前 OpenAI 账号额度或计费状态不足，因此当前不要推荐用户切过去。\n"
-        "当前已验证可用的图片模型：neobunana、gpt2、wanx2.1-t2i-turbo、wanx-v1。\n"
-        "其中 neobunana 实际走 OpenRouter 的 google/gemini-3.1-flash-image-preview；gpt2 实际走 OpenRouter 的 openai/gpt-5.4-image-2；"
+        "Deep Research 主链路当前优先走 Google Gemini Deep Research Agent（Interactions API），"
+        "其次才会回退到 OpenRouter Deep Research、OpenAI Deep Research，再不行才使用搜索总结回退。\n"
+        "当前已验证可用的图片模型：nanobanana、gpt2、wanx2.1-t2i-turbo、wanx-v1。\n"
+        "其中 nanobanana 实际走 OpenRouter 的 google/gemini-3.1-flash-image-preview；gpt2 实际走 OpenRouter 的 openai/gpt-5.4-image-2；"
         "为了稳定性，这两个兼容入口现在都会优先走 OpenRouter。\n"
         "OpenAI 直连图片模型 gpt-image-2 当前仍不稳定，最近一次直连实测返回 400 Bad Request；如果用户只是想要稳定可用，请优先推荐 OpenRouter 的 openai/gpt-5.4-image-2，"
         "不要优先推荐 OpenAI 直连 gpt-image-2。\n"
@@ -931,7 +1047,7 @@ def _chatbot_capability_summary() -> str:
         "小云雀 已正式接入当前项目，适合需要上传首帧、尾帧、参考图或关键帧参考的场景，可覆盖很多原本想用 seedance_2_0 的需求。\n"
         "wanx2.1-i2v-turbo 当前存在兼容问题，最近一次实测返回 InvalidParameter / url error，除非用户明确要求排查，否则不要优先推荐它。\n"
         "seedance_2_0 当前未配置 SEEDANCE_API_KEY、SEEDANCE_BASE_URL、SEEDANCE_MODEL_ID，因此当前不可用。\n"
-        "如果用户问“现在最稳妥怎么选”：默认优先建议 文本 deepseek-v4-pro 或 deepseek-v4-flash，图片 neobunana 或 gpt2，视频优先按场景在 小云雀、wan2.2-kf2v-flash、wanx2.1-kf2v-plus、wan2.2-t2v-plus 之间选择。"
+        "如果用户问“现在最稳妥怎么选”：默认优先建议 文本 deepseek-v4-pro 或 deepseek-v4-flash，图片 nanobanana 或 gpt2，视频优先按场景在 小云雀、wan2.2-kf2v-flash、wanx2.1-kf2v-plus、wan2.2-t2v-plus 之间选择。"
     )
 
 
@@ -944,15 +1060,52 @@ async def _deep_research_reply(
 ) -> str:
     references = await _load_feishu_references_from_text(query)
     report_markdown = ""
-    try:
-        report_markdown = await _openai_deep_research_report(query=query, references=references, project=project)
-    except Exception:
+    execution_path = ""
+    fallback_reason = ""
+    errors: list[str] = []
+    primary_attempts: list[tuple[str, str, Any]] = []
+    if settings.google_api_key:
+        primary_attempts.append(
+            (
+                "Gemini Deep Research",
+                f"Gemini Deep Research（{settings.google_deep_research_model}）",
+                _google_deep_research_report,
+            )
+        )
+    if settings.openrouter_api_key:
+        primary_attempts.append(
+            (
+                "OpenRouter Deep Research",
+                f"OpenRouter Deep Research（{settings.openrouter_deep_research_model}）",
+                _openrouter_deep_research_report,
+            )
+        )
+    if settings.openai_api_key:
+        primary_attempts.append(
+            (
+                "OpenAI Deep Research",
+                f"OpenAI Deep Research（{settings.openai_deep_research_model}）",
+                _openai_deep_research_report,
+            )
+        )
+    if not primary_attempts:
+        errors.append("No Deep Research primary provider configured")
+    for label, path_label, runner in primary_attempts:
+        try:
+            report_markdown = await runner(query=query, references=references, project=project)
+            execution_path = path_label
+            break
+        except Exception as exc:
+            errors.append(_format_research_error(label, exc))
+    if not execution_path:
         report_markdown = await _fallback_research_report(
             query=query,
             references=references,
             active_model=active_model,
             messages=messages,
         )
+        execution_path = f"Fallback 搜索总结（{active_model}）"
+        fallback_reason = "；".join(item for item in errors if item)[:400]
 
     workspace = FeishuWorkspaceService()
     saved_doc = await workspace.save_markdown_document(
@@ -960,7 +1113,14 @@ async def _deep_research_reply(
         markdown=report_markdown,
         folder_token=settings.feishu_root_folder_token,
     )
+    meta_lines = [
+        "**研究执行路径**",
+        f"- 路径：{execution_path or '未知'}",
+    ]
+    if fallback_reason:
+        meta_lines.append(f"- 回退原因：`{fallback_reason}`")
     return (
+        f"{chr(10).join(meta_lines)}\n\n"
         f"{report_markdown}\n\n"
         f"**已保存飞书文档**\n"
         f"- [打开研究文档]({saved_doc.url})"
@@ -1001,6 +1161,70 @@ async def _openai_deep_research_report(*, query: str, references: list[dict], pr
     return _format_openai_research_response(response.json())
 
 
+async def _google_deep_research_report(*, query: str, references: list[dict], project: Project | None) -> str:
+    if not settings.google_api_key:
+        raise RuntimeError("GOOGLE_API_KEY is required")
+    prompt = _deep_research_prompt(query=query, references=references, project=project)
+    body = {
+        "input": prompt,
+        "agent": settings.google_deep_research_model,
+        "background": True,
+        "agent_config": {
+            "type": "deep-research",
+            "thinking_summaries": "auto",
+        },
+    }
+    headers = {
+        "x-goog-api-key": settings.google_api_key,
+        "Content-Type": "application/json",
+    }
+    base_url = settings.google_base_url.rstrip("/")
+    async with httpx.AsyncClient(timeout=120) as client:
+        create_response = await client.post(f"{base_url}/v1beta/interactions", headers=headers, json=body)
+        create_response.raise_for_status()
+        interaction = create_response.json()
+        interaction_id = str(interaction.get("id") or "").strip()
+        if not interaction_id:
+            raise RuntimeError("Gemini Deep Research did not return an interaction id")
+        for _ in range(settings.google_deep_research_max_poll_attempts):
+            poll_response = await client.get(f"{base_url}/v1beta/interactions/{interaction_id}", headers=headers)
+            poll_response.raise_for_status()
+            interaction = poll_response.json()
+            status = str(interaction.get("status") or "").strip().lower()
+            if status == "completed":
+                return _format_google_interaction_response(interaction)
+            if status in {"failed", "cancelled", "canceled"}:
+                error_message = _google_interaction_error(interaction) or f"interaction status={status}"
+                raise RuntimeError(error_message)
+            await asyncio.sleep(settings.google_deep_research_poll_interval_seconds)
+    raise RuntimeError(
+        "Gemini Deep Research polling timed out "
+        f"after {settings.google_deep_research_max_poll_attempts} attempts"
+    )
+
+
+async def _openrouter_deep_research_report(*, query: str, references: list[dict], project: Project | None) -> str:
+    if not settings.openrouter_api_key:
+        raise RuntimeError("OPENROUTER_API_KEY is required")
+    prompt = _deep_research_prompt(query=query, references=references, project=project)
+    body = {
+        "model": settings.openrouter_deep_research_model,
+        "messages": [{"role": "user", "content": prompt}],
+        "reasoning": {
+            "effort": "medium",
+            "exclude": True,
+        },
+    }
+    async with httpx.AsyncClient(timeout=900) as client:
+        response = await client.post(
+            f"{settings.openrouter_base_url.rstrip('/')}/chat/completions",
+            headers={"Authorization": f"Bearer {settings.openrouter_api_key}", "Content-Type": "application/json"},
+            json=body,
+        )
+    response.raise_for_status()
+    return _chat_content_from_response(response.json())
+
+
 async def _fallback_research_report(
     *,
     query: str,
@@ -1029,6 +1253,11 @@ async def _fallback_research_report(
     if active_model.startswith("qwen") and settings.dashscope_api_key:
         return await _dashscope_chat(model=active_model, messages=fallback_messages)
     return await _deepseek_chat(model=settings.deepseek_text_model, messages=fallback_messages)
+
+
+def _format_research_error(label: str, exc: Exception) -> str:
+    message = str(exc).strip() or type(exc).__name__
+    return f"{label}: {message}"
 
 
 def _deep_research_prompt(*, query: str, references: list[dict], project: Project | None) -> str:
@@ -1073,6 +1302,53 @@ def _format_openai_research_response(data: dict) -> str:
     for index, citation in enumerate(citations, start=1):
         source_lines.append(f"{index}. [{citation['title']}]({citation['url']})")
     return (text or "我没有生成有效研究结果。").strip() + "\n" + "\n".join(source_lines)
+
+
+def _format_google_interaction_response(data: dict) -> str:
+    text = _extract_google_interaction_text(data)
+    if text:
+        return text
+    raise RuntimeError("Gemini Deep Research completed without a readable text report")
+
+
+def _extract_google_interaction_text(data: dict) -> str:
+    for step in reversed(data.get("steps") or []):
+        for content in step.get("content") or []:
+            if not isinstance(content, dict):
+                continue
+            if content.get("type") == "text" and content.get("text"):
+                text = str(content.get("text") or "").strip()
+                if text:
+                    return text
+    for output in reversed(data.get("outputs") or []):
+        text = str(output.get("text") or "").strip()
+        if text:
+            return text
+    return ""
+
+
+def _google_interaction_error(data: dict) -> str:
+    error = data.get("error")
+    if isinstance(error, dict):
+        return str(error.get("message") or error.get("code") or "").strip()
+    return str(error or "").strip()
+
+
+def _chat_content_from_response(data: dict) -> str:
+    message = (data.get("choices") or [{}])[0].get("message") or {}
+    content = message.get("content")
+    if isinstance(content, str):
+        return content.strip() or "我没有生成有效研究结果。"
+    if isinstance(content, list):
+        parts: list[str] = []
+        for item in content:
+            if isinstance(item, dict):
+                text = str(item.get("text") or item.get("content") or "").strip()
+                if text:
+                    parts.append(text)
+        if parts:
+            return "\n".join(parts).strip()
+    return "我没有生成有效研究结果。"
 
 
 def _collect_openai_citations(data: dict) -> list[dict[str, str]]:

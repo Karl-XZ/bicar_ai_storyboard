@@ -27,6 +27,7 @@ def test_help_card_contains_core_commands():
     assert "/New session" in content
     assert "/普通助手" in content
     assert "/分镜助手" in content
+    assert "/视频助手" in content
     assert "/Deep Research" in content
     assert "/直接生成图片" in content
     assert "/直接生成视频" in content
@@ -92,16 +93,17 @@ def test_new_session_command_aliases():
 def test_assistant_mode_command_aliases():
     assert _parse_assistant_mode_command("Deep Research").mode == "deep_research"
     assert _parse_assistant_mode_command("分镜助手").mode == "storyboard"
+    assert _parse_assistant_mode_command("视频助手").mode == "storyboard"
     assert _parse_assistant_mode_command("普通助手").mode == "chat"
 
 
 def test_direct_image_command_parses_model_prompt_and_reference():
     command = _parse_direct_generation_command(
-        "直接生成图片 模型=neobunana 提示词=把这张图改成卡通海报风 参考图=https://foo.feishu.cn/file/abc123"
+        "直接生成图片 模型=nanobanana 提示词=把这张图改成卡通海报风 参考图=https://foo.feishu.cn/file/abc123"
     )
     assert command is not None
     assert command.kind == "image"
-    assert command.model == "neobunana"
+    assert command.model == "nanobanana"
     assert command.prompt == "把这张图改成卡通海报风"
     assert command.reference_images == ("https://foo.feishu.cn/file/abc123",)
 
@@ -119,10 +121,13 @@ def test_direct_video_command_parses_frames_and_duration():
 
 
 def test_chatbot_reply_card_uses_markdown_block():
-    card = chatbot_reply_card(content="**重点**\n- 第一条\n```python\nprint(1)\n```")
+    card = chatbot_reply_card(content="**重点**\n- 第一条\n```python\nprint(1)\n```", chat_type="group", sender_open_id="ou_alice")
     assert card["header"]["title"]["content"] == "AI 助手"
     assert card["elements"][0]["tag"] == "markdown"
     assert "**重点**" in card["elements"][0]["content"]
+    assert card["elements"][1]["tag"] == "action"
+    labels = [item["text"]["content"] for item in card["elements"][1]["actions"]]
+    assert labels == ["/New Session", "/视频助手", "/Deep Research"]
 
 
 def test_render_feishu_markdown_converts_gfm_table_to_feishu_table_tag():

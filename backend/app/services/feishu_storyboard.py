@@ -10,13 +10,14 @@ from app.adapters.feishu import FeishuClient
 from app.adapters.feishu_cards import batch_done_card, progress_card, project_created_card
 from app.adapters.feishu_fields import bitable_field_definitions, build_field_map
 from app.core.config import settings
-from app.core.model_aliases import IMAGE_MODEL_NEOBUNANA, VIDEO_MODEL_XYQ, normalize_image_model, normalize_video_model, video_provider_display
+from app.core.model_aliases import IMAGE_MODEL_NANOBANANA, VIDEO_MODEL_XYQ, normalize_image_model, normalize_video_model, video_provider_display
 from app.domain.enums import AssetType, Satisfaction, ShotStatus
 from app.domain.schemas import CreateProjectRequest
 from app.models.asset import Asset
 from app.models.project import Project
 from app.models.shot import Shot
 from app.services.assets import AssetService
+from app.services.feishu_workspace import FeishuWorkspaceService
 from app.services.projects import ProjectService
 from app.services.shots import (
     GENERATION_STATUS_DONE,
@@ -619,7 +620,11 @@ class FeishuStoryboardService:
 
     async def _provision_feishu_resources(self, project: Project, *, parent_folder_url: str | None = None) -> dict:
         parent_folder_token = self._folder_token_from_url(parent_folder_url) or settings.feishu_root_folder_token or "root"
-        project_folder = await self.feishu.create_folder(parent_folder_token, project.name)
+        workspace = FeishuWorkspaceService(feishu=self.feishu)
+        project_folder, resolved_parent = await workspace.create_folder_with_fallback(
+            parent_token=parent_folder_token,
+            name=project.name,
+        )
         project_folder_token = self._extract_token(project_folder)
         folders = {}
         for key, name in {
@@ -631,7 +636,12 @@ class FeishuStoryboardService:
         }.items():
             folder = await self.feishu.create_folder(project_folder_token, name)
             folders[key] = self._extract_token(folder)
-        bitable = await self.feishu.create_bitable_app(f"{project.name}_分镜表", folder_token=project_folder_token)
+        bitable, resolved_bitable_folder = await workspace.create_bitable_with_fallback(
+            name=f"{project.name}_分镜表",
+            folder_token=project_folder_token,
+        )
+        if resolved_bitable_folder != project_folder_token:
+            project_folder_token = resolved_bitable_folder
         app_token = self._extract_app_token(bitable)
         table = await self.feishu.create_table(app_token, "分镜表", bitable_field_definitions())
         table_id = self._extract_table_id(table)
@@ -652,6 +662,7 @@ class FeishuStoryboardService:
             "table_id": table_id,
             "table_url": self._bitable_table_url(app_url, app_token, table_id),
             "folder_url": self._extract_url(project_folder) or self._drive_url(project_folder_token),
+            "resolved_parent_folder_token": resolved_parent,
         }
 
     async def _attach_assets(
@@ -703,11 +714,16 @@ class FeishuStoryboardService:
         path = Path(asset.storage_uri.replace("file://", ""))
         if not path.exists():
             return None
-        response = await self.feishu.upload_file(folder_token, path.name, path.read_bytes())
+        workspace = FeishuWorkspaceService(feishu=self.feishu)
+        response, resolved_folder = await workspace.upload_file_with_fallback(
+            target_folder=folder_token,
+            name=path.name,
+            content=path.read_bytes(),
+        )
         token = self._extract_file_token(response)
         if token:
             asset.feishu_drive_token = token
-            asset.feishu_drive_folder_token = folder_token
+            asset.feishu_drive_folder_token = resolved_folder
             self.db.flush()
         return token
 

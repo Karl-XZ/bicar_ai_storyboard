@@ -79,6 +79,9 @@ def on_message_receive(data) -> None:
 def on_card_action(data) -> P2CardActionTriggerResponse:
     value: dict[str, Any] = (data.event.action.value if data.event and data.event.action else {}) or {}
     chat_id = data.event.context.open_chat_id if data.event and data.event.context else settings.feishu_default_chat_id
+    operator_open_id = data.event.operator.open_id if data.event and data.event.operator else None
+    if operator_open_id and "sender_open_id" not in value:
+        value["sender_open_id"] = operator_open_id
     logger.info("received card action chat_id=%s value=%s", chat_id, json.dumps(value, ensure_ascii=False))
     message_executor.submit(_run_card_action, value, chat_id)
     response = P2CardActionTriggerResponse()

@@ -1,6 +1,7 @@
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker
 
+from app.adapters.feishu import FeishuApiError
 from app.domain.enums import AssetType, ShotStatus
 from app.models.asset import Asset
 from app.models import Base
@@ -49,6 +50,19 @@ class FakeFeishuClient:
 
     async def create_folder(self, parent_token: str, name: str) -> dict:
         return {"code": 0, "data": {"token": f"fld_{len(name)}_{len(parent_token)}", "url": f"https://feishu.test/{name}"}}
+
+    async def list_folder_items(self, folder_token: str, *, page_size: int = 200, page_token: str | None = None) -> dict:
+        if folder_token == "parent_folder":
+            return {
+                "code": 0,
+                "data": {
+                    "files": [
+                        {"name": "AI分镜", "token": "new_root", "type": "folder", "url": "https://feishu.test/drive/folder/new_root"}
+                    ],
+                    "has_more": False,
+                },
+            }
+        return {"code": 0, "data": {"files": [], "has_more": False}}
 
     async def create_bitable_app(self, name: str, folder_token: str = "") -> dict:
         return {"code": 0, "data": {"app": {"app_token": "app_001", "url": "https://feishu.test/base/app_001"}}}
@@ -448,5 +462,52 @@ def test_ensure_table_fields_deletes_legacy_shot_no_columns(monkeypatch):
 
         assert fake.deleted_fields == ["legacy_1", "legacy_2"]
         assert all(field["field_name"] != "镜号" for field in fake.fields)
+
+    asyncio.run(run_flow())
+
+
+def test_upload_drive_asset_falls_back_to_default_workspace_when_project_folder_is_missing(monkeypatch, tmp_path):
+    import asyncio
+
+    async def run_flow():
+        monkeypatch.setattr(settings, "default_text_provider", "mock")
+        monkeypatch.setattr(settings, "default_image_provider", "mock")
+        monkeypatch.setattr(settings, "default_video_provider", "mock")
+        monkeypatch.setattr(settings, "feishu_workspace_parent_url", "https://feishu.test/drive/folder/parent_folder")
+        monkeypatch.setattr(settings, "feishu_workspace_folder_name", "AI分镜")
+        db = make_db()
+        fake = FakeFeishuClient()
+
+        async def upload_file(folder_token: str, name: str, content: bytes) -> dict:
+            token = f"file_{len(fake.uploaded_files) + 1}"
+            fake.uploaded_files.append({"folder_token": folder_token, "name": name, "content": content})
+            if folder_token == "missing_frames":
+                raise FeishuApiError("Feishu HTTP error: 400, msg=parent node not exist.")
+            return {"code": 0, "data": {"file_token": token}}
+
+        fake.upload_file = upload_file
+        service = FeishuStoryboardService(db, feishu=fake)
+        provisioned = await service.create_project_from_bot(project_name="目录回退项目", chat_id="oc_test")
+        await service.sync_from_feishu(provisioned.project)
+        shot = ProjectService(db).list_shots(provisioned.project.id)[0]
+        frame_path = tmp_path / "frame.png"
+        frame_path.write_bytes(b"frame")
+        asset = Asset(
+            project_id=provisioned.project.id,
+            shot_id=shot.id,
+            asset_type=AssetType.FIRST_FRAME.value,
+            storage_uri=f"file://{frame_path}",
+            public_url="https://storage.test/frame.png",
+            provider="mock",
+            model_id="mock-image-v1",
+        )
+        db.add(asset)
+        db.commit()
+
+        token = await service._upload_drive_asset(asset, "missing_frames")
+
+        assert token == "file_2"
+        assert asset.feishu_drive_folder_token == "new_root"
+        assert [item["folder_token"] for item in fake.uploaded_files] == ["missing_frames", "new_root"]
 
     asyncio.run(run_flow())

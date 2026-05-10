@@ -45,12 +45,41 @@ def project_overview_card(*, project_name: str, table_url: str | None, stats: di
     }
 
 
-def chatbot_reply_card(*, content: str, title: str = "AI 助手") -> dict:
+def chatbot_reply_card(*, content: str, title: str = "AI 助手", chat_type: str | None = None, sender_open_id: str | None = None) -> dict:
     markdown = render_feishu_markdown(content)
+    quick_action_value = {
+        "chat_type": chat_type,
+        "sender_open_id": sender_open_id,
+    }
     return {
         "config": {"wide_screen_mode": True},
         "header": {"title": {"tag": "plain_text", "content": title}, "template": "wathet"},
-        "elements": [{"tag": "markdown", "content": markdown}],
+        "elements": [
+            {"tag": "markdown", "content": markdown},
+            {
+                "tag": "action",
+                "actions": [
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "/New Session"},
+                        "type": "default",
+                        "value": {**quick_action_value, "action": "assistant.clear_session"},
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "/视频助手"},
+                        "type": "default",
+                        "value": {**quick_action_value, "action": "assistant.set_mode", "mode": "storyboard"},
+                    },
+                    {
+                        "tag": "button",
+                        "text": {"tag": "plain_text", "content": "/Deep Research"},
+                        "type": "primary",
+                        "value": {**quick_action_value, "action": "assistant.set_mode", "mode": "deep_research"},
+                    },
+                ],
+            },
+        ],
     }
 
 
@@ -176,7 +205,7 @@ def help_card() -> dict:
             "",
             "- 直接聊天：不加 `/` 时，机器人会按普通 AI 助手回复",
             "- `/普通助手`：把当前会话切回普通对话助手",
-            "- `/分镜助手`：把当前会话切到分镜工作流助手",
+            "- `/分镜助手` / `/视频助手`：把当前会话切到分镜工作流助手",
             "- `/Deep Research`：把当前会话切到深度研究模式，后续会联网检索并把研究结果保存为飞书文档",
             "- `/help` / `/帮助` / `/菜单`：查看这张说明卡片",
             "- `/New session`：重置当前群聊或私聊会话的聊天记录，不影响项目和模型设置",
@@ -202,10 +231,10 @@ def help_card() -> dict:
             "**直接生成示例**",
             "",
             "- `/直接生成图片`",
-            "- `模型=neobunana`",
+            "- `模型=nanobanana`",
             "- `提示词=夕阳下的海边咖啡馆，暖光，电影感`",
             "- `/直接生成图片`",
-            "- `模型=neobunana`",
+            "- `模型=nanobanana`",
             "- `提示词=把这张图改成卡通海报风`",
             "- `参考图=https://xxx.feishu.cn/file/FILE_TOKEN`",
             "- `/直接生成视频`",

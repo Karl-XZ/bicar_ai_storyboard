@@ -1,5 +1,5 @@
 from app.core.config import settings
-from app.core.model_aliases import IMAGE_MODEL_GPT2, IMAGE_MODEL_NEOBUNANA
+from app.core.model_aliases import IMAGE_MODEL_GPT2, IMAGE_MODEL_NANOBANANA
 from app.providers.base import ImageProvider, TextProvider, VideoProvider
 from app.providers.deepseek_text import DeepSeekTextProvider
 from app.providers.dashscope import DashScopeImageProvider, DashScopeTextProvider, DashScopeVideoProvider
@@ -32,7 +32,7 @@ class ProviderRouter:
             return DashScopeImageProvider()
         if selected in {"gpt_image_2", IMAGE_MODEL_GPT2} and settings.openrouter_api_key:
             return OpenRouterImageProvider()
-        if selected in {"nano_banana_2", IMAGE_MODEL_NEOBUNANA}:
+        if selected in {"nano_banana_2", IMAGE_MODEL_NANOBANANA}:
             if settings.openrouter_api_key:
                 return OpenRouterImageProvider()
             if settings.google_api_key:

@@ -4,7 +4,7 @@ from uuid import UUID
 from pydantic import BaseModel, Field
 
 from app.core.config import settings
-from app.core.model_aliases import IMAGE_MODEL_NEOBUNANA
+from app.core.model_aliases import IMAGE_MODEL_NANOBANANA
 from app.domain.enums import Satisfaction
 
 
@@ -21,8 +21,8 @@ def _default_image_model() -> str:
     return {
         "dashscope": settings.dashscope_image_model,
         "openai": settings.openai_image_model,
-        "nano_banana_2": IMAGE_MODEL_NEOBUNANA,
-        "openrouter": IMAGE_MODEL_NEOBUNANA,
+        "nano_banana_2": IMAGE_MODEL_NANOBANANA,
+        "openrouter": IMAGE_MODEL_NANOBANANA,
     }.get(settings.default_image_provider, settings.dashscope_image_model)
 
 
