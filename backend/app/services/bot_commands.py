@@ -1,15 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import json
 import mimetypes
 import re
+import shutil
 import tempfile
 from datetime import datetime
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any
+from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qs, unquote, urlparse
+import time
 
 import httpx
 from sqlalchemy.orm import Session
@@ -19,7 +22,7 @@ from app.adapters.feishu_cards import chatbot_reply_card, help_card
 from app.core.config import settings
 from app.core.model_aliases import IMAGE_MODEL_GPT2, IMAGE_MODEL_NANOBANANA, VIDEO_MODEL_XYQ, normalize_image_model, normalize_video_model
 from app.models.project import Project
-from app.services.chat_memory import ChatMemoryService
+from app.services.chat_memory import ChatMemoryService, resolve_chat_session
 from app.services.chat_preferences import ChatPreferenceService
 from app.services.feishu_storyboard import FeishuStoryboardService
 from app.services.feishu_workspace import FeishuWorkspaceService
@@ -29,8 +32,10 @@ from app.providers.router import ProviderRouter
 
 LAST_MODEL_SMOKE_TEST_DATE = "2026-05-08"
 ASSISTANT_MODE_CHAT = "chat"
+ASSISTANT_MODE_AGENT = "agent"
 ASSISTANT_MODE_STORYBOARD = "storyboard"
 ASSISTANT_MODE_DEEP_RESEARCH = "deep_research"
+ASSISTANT_MODE_STORYBOARD_BREAKDOWN = "storyboard_breakdown"
 DIRECT_IMAGE_MODELS = {
     IMAGE_MODEL_NANOBANANA,
     IMAGE_MODEL_GPT2,
@@ -61,6 +66,9 @@ DIRECT_FIELD_ALIASES = {
     "last_frame": {"尾帧", "last_frame"},
     "keyframes": {"关键帧", "keyframes"},
 }
+STREAM_REPLY_TARGET_CHARS = 900
+STREAM_REPLY_MAX_CHARS = 1300
+LOCAL_ARTIFACT_EXTENSIONS = ("png", "jpg", "jpeg", "webp", "gif", "bmp", "mp4", "mov", "m4v", "webm", "pdf", "docx", "txt", "md")
 
 
 @dataclass(frozen=True)
@@ -81,6 +89,88 @@ class DirectGenerationCommand:
 class AssistantModeCommand:
     mode: str
     prompt: str = ""
+    agent_runtime: str | None = None
+
+
+@dataclass(frozen=True)
+class DeepResearchResult:
+    markdown: str
+    raw_text: str = ""
+    raw_payload: Any | None = None
+
+
+@dataclass(frozen=True)
+class ChatRequestContext:
+    session_key: str
+    request_id: int
+
+
+class StaleChatRequest(RuntimeError):
+    pass
+
+
+_ACTIVE_CHAT_REQUESTS: dict[str, int] = {}
+_ACTIVE_OPENCLAW_PROCESSES: dict[str, asyncio.subprocess.Process] = {}
+_RECENT_MODE_SWITCHES: dict[str, tuple[str, float]] = {}
+
+AGENT_RUNTIME_CODEX = "codex"
+AGENT_RUNTIME_DEEPSEEK = "deepseek"
+AGENT_RUNTIMES = {AGENT_RUNTIME_CODEX, AGENT_RUNTIME_DEEPSEEK}
+
+
+def _begin_chat_request(*, chat_id: str | None, chat_type: str | None, sender_open_id: str | None) -> ChatRequestContext:
+    session = resolve_chat_session(chat_id=chat_id, chat_type=chat_type, sender_open_id=sender_open_id)
+    next_request_id = _ACTIVE_CHAT_REQUESTS.get(session.session_key, 0) + 1
+    _ACTIVE_CHAT_REQUESTS[session.session_key] = next_request_id
+    return ChatRequestContext(session_key=session.session_key, request_id=next_request_id)
+
+
+def _invalidate_chat_session(*, chat_id: str | None, chat_type: str | None, sender_open_id: str | None) -> None:
+    session = resolve_chat_session(chat_id=chat_id, chat_type=chat_type, sender_open_id=sender_open_id)
+    _ACTIVE_CHAT_REQUESTS[session.session_key] = _ACTIVE_CHAT_REQUESTS.get(session.session_key, 0) + 1
+
+
+def _terminate_openclaw_process_for_session(session_key: str) -> bool:
+    process = _ACTIVE_OPENCLAW_PROCESSES.pop(session_key, None)
+    if not process:
+        return False
+    try:
+        if process.returncode is None:
+            process.terminate()
+            return True
+    except ProcessLookupError:
+        return False
+    return False
+
+
+def _normalize_agent_runtime(value: str | None) -> str:
+    normalized = str(value or "").strip().lower()
+    if normalized in {"deepseek", "ds"}:
+        return AGENT_RUNTIME_DEEPSEEK
+    return AGENT_RUNTIME_CODEX
+
+
+def _note_mode_switch(session_key: str, mode: str) -> None:
+    _RECENT_MODE_SWITCHES[session_key] = (mode, time.monotonic())
+
+
+def _is_duplicate_mode_switch(session_key: str, mode: str, window_seconds: float = 2.0) -> bool:
+    previous = _RECENT_MODE_SWITCHES.get(session_key)
+    if not previous:
+        return False
+    previous_mode, previous_at = previous
+    return previous_mode == mode and (time.monotonic() - previous_at) <= window_seconds
+
+
+def _is_request_current(request_context: ChatRequestContext | None) -> bool:
+    if request_context is None:
+        return True
+    return _ACTIVE_CHAT_REQUESTS.get(request_context.session_key) == request_context.request_id
+
+
+def _assert_request_current(request_context: ChatRequestContext | None) -> None:
+    if not _is_request_current(request_context):
+        raise StaleChatRequest("stale chat request")
 
 
 async def handle_bot_text(
@@ -90,31 +180,61 @@ async def handle_bot_text(
     chat_id: str | None = None,
     chat_type: str | None = None,
     sender_open_id: str | None = None,
+    source_message_id: str | None = None,
 ) -> dict[str, Any] | None:
     target_chat = chat_id or settings.feishu_default_chat_id
+    session_chat_id = chat_id
     feishu = FeishuClient()
+
     if not _is_slash_command(text):
+        if not str(text or "").strip():
+            if target_chat:
+                await feishu.send_text(target_chat, "我收到了一个图片、附件或特殊格式消息，但没有解析到可读正文。请补充一句说明，或直接发送文档/文件链接。")
+            return {"message": "chatbot 未解析到正文", "data": {"chat_id": target_chat}}
+        request_context = _begin_chat_request(
+            chat_id=session_chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+        )
+
+        async def progress_notifier(message: str) -> None:
+            if target_chat and message and _is_request_current(request_context):
+                await feishu.send_text(target_chat, message)
+
         current_mode = ChatPreferenceService(db).get_assistant_mode(
-            chat_id=target_chat,
+            chat_id=session_chat_id,
             chat_type=chat_type,
             sender_open_id=sender_open_id,
         )
-        reply = await _chatbot_reply(
-            db,
-            text=text,
-            chat_id=target_chat,
-            chat_type=chat_type,
-            sender_open_id=sender_open_id,
-        )
-        if target_chat and reply:
-            await feishu.send_card(
-                target_chat,
-                chatbot_reply_card(
-                    content=reply,
-                    title=_assistant_card_title(current_mode),
-                    chat_type=chat_type,
-                    sender_open_id=sender_open_id,
-                ),
+        try:
+            reply = await _reply_with_timeout_hint(
+                db,
+                text=text,
+                chat_id=session_chat_id,
+                chat_type=chat_type,
+                sender_open_id=sender_open_id,
+                source_message_id=source_message_id,
+                progress_notifier=progress_notifier,
+                hint_enabled=current_mode == ASSISTANT_MODE_CHAT,
+                feishu=feishu,
+                request_context=request_context,
+            )
+        except StaleChatRequest:
+            return {"message": "chatbot 旧回复已抑制", "data": {"chat_id": target_chat}}
+        except Exception as exc:
+            if target_chat:
+                await feishu.send_text(target_chat, _chatbot_failure_message(exc))
+            return {"message": "chatbot 回复失败", "data": {"chat_id": target_chat, "error": str(exc)}}
+        if target_chat and reply and _is_request_current(request_context):
+            await _send_reply_segmented(
+                feishu=feishu,
+                target_chat=target_chat,
+                content=reply,
+                title=_assistant_card_title(current_mode),
+                chat_id=session_chat_id,
+                chat_type=chat_type,
+                sender_open_id=sender_open_id,
+                request_context=request_context,
             )
         return {"message": "chatbot 已回复", "data": {"chat_id": target_chat}}
 
@@ -125,9 +245,19 @@ async def handle_bot_text(
         return {"message": "帮助已发送", "data": {"chat_id": target_chat}}
 
     if _is_new_session_command(command_text):
+        _invalidate_chat_session(
+            chat_id=session_chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+        )
+        ChatPreferenceService(db).bump_agent_session_nonce(
+            chat_id=session_chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+        )
         cleared = ChatMemoryService(
             db,
-            chat_id=target_chat,
+            chat_id=session_chat_id,
             chat_type=chat_type,
             sender_open_id=sender_open_id,
         ).clear()
@@ -136,36 +266,124 @@ async def handle_bot_text(
             await feishu.send_text(target_chat, "当前会话的聊天记录已重置。")
         return {"message": "聊天记录已重置", "data": {"chat_id": target_chat, "cleared_messages": cleared}}
 
+    if _is_stop_command(command_text):
+        session = resolve_chat_session(chat_id=session_chat_id, chat_type=chat_type, sender_open_id=sender_open_id)
+        _invalidate_chat_session(
+            chat_id=session_chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+        )
+        ChatPreferenceService(db).bump_agent_session_nonce(
+            chat_id=session_chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+        )
+        db.commit()
+        terminated = _terminate_openclaw_process_for_session(session.session_key)
+        if target_chat:
+            await feishu.send_text(target_chat, "当前 Agent 任务已停止。" if terminated else "已请求停止当前会话任务；如仍有旧回复，将被自动抑制。")
+        return {"message": "当前任务已停止", "data": {"chat_id": target_chat, "terminated": terminated}}
+
     mode_command = _parse_assistant_mode_command(command_text)
     if mode_command:
-        ChatPreferenceService(db).set_assistant_mode(
-            chat_id=target_chat,
+        session = resolve_chat_session(chat_id=session_chat_id, chat_type=chat_type, sender_open_id=sender_open_id)
+        preferences = ChatPreferenceService(db)
+        current_mode = preferences.get_assistant_mode(
+            chat_id=session_chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+        )
+        current_runtime = preferences.get_agent_runtime(
+            chat_id=session_chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+        )
+        duplicate_mode_switch = _is_duplicate_mode_switch(session.session_key, mode_command.mode)
+        runtime_changed = False
+        if mode_command.agent_runtime:
+            normalized_runtime = _normalize_agent_runtime(mode_command.agent_runtime)
+            runtime_changed = normalized_runtime != _normalize_agent_runtime(current_runtime)
+            preferences.set_agent_runtime(
+                chat_id=session_chat_id,
+                chat_type=chat_type,
+                sender_open_id=sender_open_id,
+                runtime=normalized_runtime,
+            )
+        if duplicate_mode_switch and not runtime_changed and not mode_command.prompt and current_mode == mode_command.mode:
+            return {"message": "聊天模式重复切换已忽略", "data": {"mode": mode_command.mode}}
+        _invalidate_chat_session(
+            chat_id=session_chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+        )
+        preferences.set_assistant_mode(
+            chat_id=session_chat_id,
             chat_type=chat_type,
             sender_open_id=sender_open_id,
             mode=mode_command.mode,
         )
+        if runtime_changed or current_mode == ASSISTANT_MODE_AGENT or mode_command.mode != ASSISTANT_MODE_AGENT:
+            preferences.bump_agent_session_nonce(
+                chat_id=session_chat_id,
+                chat_type=chat_type,
+                sender_open_id=sender_open_id,
+            )
+            _terminate_openclaw_process_for_session(session.session_key)
         db.commit()
+        _note_mode_switch(session.session_key, mode_command.mode)
         if not mode_command.prompt:
-            mode_name = _assistant_mode_label(mode_command.mode)
             if target_chat:
-                await feishu.send_text(target_chat, f"当前会话已切换为：{mode_name}")
+                await feishu.send_text(
+                    target_chat,
+                    _assistant_mode_activation_hint(
+                        mode_command.mode,
+                        agent_runtime=preferences.get_agent_runtime(
+                            chat_id=session_chat_id,
+                            chat_type=chat_type,
+                            sender_open_id=sender_open_id,
+                        ),
+                    ),
+                )
             return {"message": "聊天模式已切换", "data": {"mode": mode_command.mode}}
-        reply = await _chatbot_reply(
-            db,
-            text=mode_command.prompt,
-            chat_id=target_chat,
+        request_context = _begin_chat_request(
+            chat_id=session_chat_id,
             chat_type=chat_type,
             sender_open_id=sender_open_id,
         )
-        if target_chat and reply:
-            await feishu.send_card(
-                target_chat,
-                chatbot_reply_card(
-                    content=reply,
-                    title=_assistant_card_title(mode_command.mode),
-                    chat_type=chat_type,
-                    sender_open_id=sender_open_id,
-                ),
+
+        async def progress_notifier(message: str) -> None:
+            if target_chat and message and _is_request_current(request_context):
+                await feishu.send_text(target_chat, message)
+
+        try:
+            reply = await _reply_with_timeout_hint(
+                db,
+                text=mode_command.prompt,
+                chat_id=session_chat_id,
+                chat_type=chat_type,
+                sender_open_id=sender_open_id,
+                source_message_id=source_message_id,
+                progress_notifier=progress_notifier,
+                hint_enabled=mode_command.mode == ASSISTANT_MODE_CHAT,
+                feishu=feishu,
+                request_context=request_context,
+            )
+        except StaleChatRequest:
+            return {"message": "聊天模式已切换，旧回复已抑制", "data": {"mode": mode_command.mode, "chat_id": target_chat}}
+        except Exception as exc:
+            if target_chat:
+                await feishu.send_text(target_chat, _chatbot_failure_message(exc))
+            return {"message": "聊天模式已切换但回复失败", "data": {"mode": mode_command.mode, "chat_id": target_chat, "error": str(exc)}}
+        if target_chat and reply and _is_request_current(request_context):
+            await _send_reply_segmented(
+                feishu=feishu,
+                target_chat=target_chat,
+                content=reply,
+                title=_assistant_card_title(mode_command.mode),
+                chat_id=session_chat_id,
+                chat_type=chat_type,
+                sender_open_id=sender_open_id,
+                request_context=request_context,
             )
         return {"message": "聊天模式已切换并回复", "data": {"mode": mode_command.mode, "chat_id": target_chat}}
 
@@ -183,18 +401,42 @@ async def handle_bot_text(
     switch_model = _parse_chatbot_model_command(command_text)
     if switch_model:
         ChatPreferenceService(db).set_chatbot_text_model(
-            chat_id=target_chat,
+            chat_id=session_chat_id,
             chat_type=chat_type,
             sender_open_id=sender_open_id,
             model=switch_model,
         )
-        project = ProjectService(db).latest_for_chat(target_chat)
-        if project:
-            project.workflow_config = {**(project.workflow_config or {}), "chatbot_text_model": switch_model}
         db.commit()
         if target_chat:
             await feishu.send_text(target_chat, f"chatbot 文本模型已切换为：{switch_model}")
         return {"message": "chatbot 模型已切换", "data": {"model": switch_model}}
+
+    agent_runtime = _parse_agent_runtime_command(command_text)
+    if agent_runtime:
+        session = resolve_chat_session(chat_id=session_chat_id, chat_type=chat_type, sender_open_id=sender_open_id)
+        preferences = ChatPreferenceService(db)
+        preferences.set_agent_runtime(
+            chat_id=session_chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+            runtime=agent_runtime,
+        )
+        _invalidate_chat_session(
+            chat_id=session_chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+        )
+        preferences.bump_agent_session_nonce(
+            chat_id=session_chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+        )
+        _terminate_openclaw_process_for_session(session.session_key)
+        db.commit()
+        if target_chat:
+            runtime_label = "Codex" if agent_runtime == AGENT_RUNTIME_CODEX else "DeepSeek"
+            await feishu.send_text(target_chat, f"Agent 运行后端已切换为：{runtime_label}。当前会话下次进入 `/Agent` 或继续 Agent 对话时生效。")
+        return {"message": "agent runtime 已切换", "data": {"runtime": agent_runtime}}
 
     project_name = _parse_create_project_command(command_text)
     if project_name:
@@ -234,6 +476,7 @@ async def handle_bot_text(
 
 
 async def handle_card_action(db: Session, *, value: dict[str, Any], chat_id: str | None = None) -> dict[str, Any]:
+    resolved_chat_id = chat_id or value.get("chat_id")
     action = value.get("action")
     project_id = value.get("project_id")
     batch_no = value.get("batch_no") or "batch_001"
@@ -244,29 +487,94 @@ async def handle_card_action(db: Session, *, value: dict[str, Any], chat_id: str
         return {"message": "卡片动作已接收", "data": {"action": action}}
 
     if action == "assistant.clear_session":
+        _invalidate_chat_session(
+            chat_id=resolved_chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+        )
+        ChatPreferenceService(db).bump_agent_session_nonce(
+            chat_id=resolved_chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+        )
         cleared = ChatMemoryService(
             db,
-            chat_id=chat_id,
+            chat_id=resolved_chat_id,
             chat_type=chat_type,
             sender_open_id=sender_open_id,
         ).clear()
         db.commit()
-        if chat_id:
-            await FeishuClient().send_text(chat_id, "当前会话的聊天记录已重置。")
-        return {"message": "聊天记录已重置", "data": {"chat_id": chat_id, "cleared_messages": cleared}}
+        if resolved_chat_id:
+            await FeishuClient().send_text(resolved_chat_id, "当前会话的聊天记录已重置。")
+        return {"message": "聊天记录已重置", "data": {"chat_id": resolved_chat_id, "cleared_messages": cleared}}
+
+    if action == "assistant.upload_recent_artifact":
+        reply = await _agent_upload_recent_artifact_to_feishu(
+            db,
+            text="保存到飞书",
+            chat_id=resolved_chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+        )
+        if not reply:
+            reply = "当前会话最近没有可上传的本地产物。请先让 Agent 生成文件，或直接发送本地文件路径。"
+        if resolved_chat_id:
+            await FeishuClient().send_card(
+                resolved_chat_id,
+                chatbot_reply_card(
+                    content=reply,
+                    title="哔车AI助手 · Agent",
+                    chat_id=resolved_chat_id,
+                    chat_type=chat_type,
+                    sender_open_id=sender_open_id,
+                ),
+            )
+        return {"message": "Agent 产物上传已处理", "data": {"chat_id": resolved_chat_id}}
 
     if action == "assistant.set_mode":
         mode = str(value.get("mode") or ASSISTANT_MODE_CHAT)
-        ChatPreferenceService(db).set_assistant_mode(
-            chat_id=chat_id,
+        session = resolve_chat_session(chat_id=resolved_chat_id, chat_type=chat_type, sender_open_id=sender_open_id)
+        preferences = ChatPreferenceService(db)
+        current_mode = preferences.get_assistant_mode(
+            chat_id=resolved_chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+        )
+        if _is_duplicate_mode_switch(session.session_key, mode) and current_mode == mode:
+            return {"message": "重复模式切换已忽略", "data": {"chat_id": resolved_chat_id, "mode": mode}}
+        _invalidate_chat_session(
+            chat_id=resolved_chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+        )
+        preferences.set_assistant_mode(
+            chat_id=resolved_chat_id,
             chat_type=chat_type,
             sender_open_id=sender_open_id,
             mode=mode,
         )
+        if current_mode == ASSISTANT_MODE_AGENT or mode != ASSISTANT_MODE_AGENT:
+            preferences.bump_agent_session_nonce(
+                chat_id=resolved_chat_id,
+                chat_type=chat_type,
+                sender_open_id=sender_open_id,
+            )
+            _terminate_openclaw_process_for_session(session.session_key)
         db.commit()
-        if chat_id:
-            await FeishuClient().send_text(chat_id, f"当前会话已切换为：{_assistant_mode_label(mode)}")
-        return {"message": "聊天模式已切换", "data": {"chat_id": chat_id, "mode": mode}}
+        _note_mode_switch(session.session_key, mode)
+        if resolved_chat_id:
+            await FeishuClient().send_text(
+                resolved_chat_id,
+                _assistant_mode_activation_hint(
+                    mode,
+                    agent_runtime=preferences.get_agent_runtime(
+                        chat_id=resolved_chat_id,
+                        chat_type=chat_type,
+                        sender_open_id=sender_open_id,
+                    ),
+                ),
+            )
+        return {"message": "聊天模式已切换", "data": {"chat_id": resolved_chat_id, "mode": mode}}
 
     if not project_id:
         return {"message": "卡片动作已接收", "data": {"action": action}}
@@ -294,8 +602,8 @@ async def handle_card_action(db: Session, *, value: dict[str, Any], chat_id: str
     if action in {"project.enable_transition_alignment", "project.set_transition_alignment"}:
         enabled = _bool_value(value.get("enabled"), default=True)
         synced = await service.set_transition_alignment(project, enabled)
-        if chat_id:
-            await service.send_progress(project, chat_id=chat_id)
+        if resolved_chat_id:
+            await service.send_progress(project, chat_id=resolved_chat_id)
         return {
             "message": "首尾帧同步已开启" if enabled else "首尾帧同步已关闭",
             "data": {"project_id": project_id, "synced": synced, "enabled": enabled},
@@ -304,8 +612,8 @@ async def handle_card_action(db: Session, *, value: dict[str, Any], chat_id: str
     if action in {"project.enable_keyframes", "project.set_keyframes"}:
         enabled = _bool_value(value.get("enabled"), default=True)
         await service.set_keyframe_generation(project, enabled)
-        if chat_id:
-            await service.send_progress(project, chat_id=chat_id)
+        if resolved_chat_id:
+            await service.send_progress(project, chat_id=resolved_chat_id)
         return {
             "message": "关键帧生成已开启" if enabled else "关键帧生成已关闭",
             "data": {"project_id": project_id, "enabled": enabled},
@@ -316,7 +624,7 @@ async def handle_card_action(db: Session, *, value: dict[str, Any], chat_id: str
         return {"message": "当前批次 Prompt 已优化", "data": {"project_id": project_id, "batch_no": batch_no, "shots": len(shots)}}
 
     if action == "project.progress":
-        stats = await service.send_progress(project, chat_id=chat_id)
+        stats = await service.send_progress(project, chat_id=resolved_chat_id)
         return {"message": "项目进度已发送", "data": stats}
 
     if action == "project.sync":
@@ -379,38 +687,83 @@ def _is_help_command(text: str) -> bool:
 
 
 def _is_new_session_command(text: str) -> bool:
-    normalized = re.sub(r"\s+", " ", text.strip()).lower()
+    normalized = _normalize_command_phrase(text)
     return normalized in {"new session", "newsession", "重置聊天", "重置会话", "清空聊天记录", "清空会话"}
+
+
+def _is_stop_command(text: str) -> bool:
+    normalized = _normalize_command_phrase(text)
+    return normalized in {"stop", "停止", "停止当前任务", "停止当前agent任务", "停止当前智能体任务", "取消", "取消当前任务"}
+
+
+def _parse_agent_runtime_command(text: str) -> str | None:
+    normalized = re.sub(r"\s+", " ", text.strip())
+    match = re.match(r"^(?:切换agent模型|切换智能体模型|agent模型|智能体模型)\s+(\S+)$", normalized, flags=re.IGNORECASE)
+    if not match:
+        return None
+    runtime = _normalize_agent_runtime(match.group(1))
+    if runtime in AGENT_RUNTIMES:
+        return runtime
+    return None
 
 
 def _parse_assistant_mode_command(text: str) -> AssistantModeCommand | None:
     normalized = text.strip()
     patterns = [
+        (r"^(?:agent|codex|智能体|agent模式)(?:\s*[:：]\s*|\s+)?(.*)$", ASSISTANT_MODE_AGENT),
         (r"^(?:deep\s*research|deepresearch)(?:\s*[:：]\s*|\s+)?(.*)$", ASSISTANT_MODE_DEEP_RESEARCH),
+        (r"^(?:拆分镜需求|分镜拆解|重新拆解|拆分镜|storyboard\s*breakdown)(?:\s*[:：]\s*|\s+)?(.*)$", ASSISTANT_MODE_STORYBOARD_BREAKDOWN),
         (r"^(?:分镜助手|ai分镜助手|视频助手)(?:\s*[:：]\s*|\s+)?(.*)$", ASSISTANT_MODE_STORYBOARD),
         (r"^(?:普通助手|聊天助手|普通对话|chat)(?:\s*[:：]\s*|\s+)?(.*)$", ASSISTANT_MODE_CHAT),
     ]
     for pattern, mode in patterns:
-        match = re.match(pattern, normalized, flags=re.IGNORECASE)
+        match = re.match(pattern, normalized, flags=re.IGNORECASE | re.DOTALL)
         if match:
-            return AssistantModeCommand(mode=mode, prompt=(match.group(1) or "").strip())
+            prompt = (match.group(1) or "").strip()
+            agent_runtime: str | None = None
+            if mode == ASSISTANT_MODE_AGENT and prompt:
+                runtime_match = re.match(r"^(codex|deepseek|ds)\b(?:\s+|[:：]\s*)?(.*)$", prompt, flags=re.IGNORECASE | re.DOTALL)
+                if runtime_match:
+                    agent_runtime = _normalize_agent_runtime(runtime_match.group(1))
+                    prompt = (runtime_match.group(2) or "").strip()
+            if mode == ASSISTANT_MODE_AGENT and agent_runtime is None:
+                lowered = normalized.lower()
+                if lowered.startswith("codex"):
+                    agent_runtime = AGENT_RUNTIME_CODEX
+            return AssistantModeCommand(mode=mode, prompt=prompt, agent_runtime=agent_runtime)
     return None
 
 
 def _assistant_mode_label(mode: str) -> str:
     return {
         ASSISTANT_MODE_CHAT: "普通助手",
+        ASSISTANT_MODE_AGENT: "Agent",
         ASSISTANT_MODE_STORYBOARD: "分镜助手",
         ASSISTANT_MODE_DEEP_RESEARCH: "Deep Research",
+        ASSISTANT_MODE_STORYBOARD_BREAKDOWN: "分镜拆解",
     }.get(mode, "普通助手")
 
 
 def _assistant_card_title(mode: str) -> str:
     return {
         ASSISTANT_MODE_CHAT: "哔车AI助手",
+        ASSISTANT_MODE_AGENT: "哔车AI助手 · Agent",
         ASSISTANT_MODE_STORYBOARD: "哔车AI助手 · 分镜",
         ASSISTANT_MODE_DEEP_RESEARCH: "哔车AI助手 · Deep Research",
+        ASSISTANT_MODE_STORYBOARD_BREAKDOWN: "哔车AI助手 · 分镜拆解",
     }.get(mode, "哔车AI助手")
+
+
+def _assistant_mode_activation_hint(mode: str, *, agent_runtime: str | None = None) -> str:
+    runtime = _normalize_agent_runtime(agent_runtime)
+    agent_label = "Codex" if runtime == AGENT_RUNTIME_CODEX else "DeepSeek"
+    return {
+        ASSISTANT_MODE_CHAT: "当前会话已切换为：普通助手。你现在可以直接继续聊天。",
+        ASSISTANT_MODE_AGENT: f"当前会话已切换为：Agent（{agent_label}）。后续消息会交给 {agent_label} Agent 独立处理；群聊和私聊各自隔离。请继续发送你的任务。",
+        ASSISTANT_MODE_STORYBOARD: "当前会话已切换为：分镜助手。请继续发送分镜需求、项目命令或素材说明。",
+        ASSISTANT_MODE_DEEP_RESEARCH: "当前会话已切换为：Deep Research。请继续发送研究主题、文档链接或文件。",
+        ASSISTANT_MODE_STORYBOARD_BREAKDOWN: "当前会话已切换为：分镜拆解。请继续发送文档、文件或要拆解的需求文本。",
+    }.get(mode, "当前会话已切换为：普通助手。你现在可以直接继续聊天。")
 
 
 def _default_chatbot_text_model() -> str:
@@ -445,6 +798,147 @@ def _is_slash_command(text: str) -> bool:
 
 def _command_text(text: str) -> str:
     return text.strip()[1:].strip() if _is_slash_command(text) else text.strip()
+
+
+def _normalize_command_phrase(text: str) -> str:
+    normalized = re.sub(r"\s+", " ", text.strip()).lower()
+    normalized = normalized.rstrip("。.!！?？,，;；:：")
+    return normalized
+
+
+def _is_agent_upload_to_feishu_request(text: str) -> bool:
+    normalized = _normalize_command_phrase(text)
+    phrases = (
+        "存到飞书",
+        "保存到飞书",
+        "上传到飞书",
+        "传到飞书",
+        "发到飞书",
+        "存到ai生成",
+        "保存到ai生成",
+        "上传到ai生成",
+        "存到ai生成文件夹",
+    )
+    return any(phrase in normalized for phrase in phrases)
+
+
+def _extract_local_artifact_candidates(text: str) -> list[str]:
+    raw = str(text or "")
+    candidates: list[str] = []
+
+    for url in re.findall(r"\((file://[^\s)]+)\)", raw):
+        candidates.append(url)
+    for url in re.findall(r"(file://\S+)", raw):
+        candidates.append(url)
+    for path in re.findall(r"(/Users/[^\s)\]>]+)", raw):
+        candidates.append(path)
+    for path in re.findall(r"(/[^\s)\]>]+\.(?:%s))" % "|".join(LOCAL_ARTIFACT_EXTENSIONS), raw, flags=re.IGNORECASE):
+        candidates.append(path)
+    for match in re.findall(r"\[([^\]]+\.(?:%s))\]\([^)]+\)" % "|".join(LOCAL_ARTIFACT_EXTENSIONS), raw, flags=re.IGNORECASE):
+        candidates.append(match)
+    for name in re.findall(r"\b([A-Za-z0-9._-]+\.(?:%s))\b" % "|".join(LOCAL_ARTIFACT_EXTENSIONS), raw, flags=re.IGNORECASE):
+        candidates.append(name)
+
+    deduped: list[str] = []
+    for item in candidates:
+        value = str(item or "").strip()
+        if value and value not in deduped:
+            deduped.append(value)
+    return deduped
+
+
+def _resolve_local_artifact_path(candidate: str) -> Path | None:
+    value = str(candidate or "").strip()
+    if not value:
+        return None
+    if value.startswith("file://"):
+        path = Path(value.replace("file://", "", 1))
+        return path if path.exists() and path.is_file() else None
+    direct = Path(value)
+    if direct.is_absolute():
+        return direct if direct.exists() and direct.is_file() else None
+
+    roots = [
+        Path.cwd(),
+        Path("/Users/applemima111/.openclaw/workspace"),
+        Path("/Users/applemima111/Desktop/动画/bicaraifilm"),
+        Path("/Users/applemima111/bicar_runtime"),
+    ]
+    matches: list[Path] = []
+    for root in roots:
+        if not root.exists():
+            continue
+        try:
+            found = list(root.rglob(value))
+        except OSError:
+            continue
+        for item in found:
+            if item.is_file():
+                matches.append(item)
+    if not matches:
+        return None
+    matches.sort(key=lambda item: item.stat().st_mtime, reverse=True)
+    return matches[0]
+
+
+async def _agent_upload_recent_artifact_to_feishu(
+    db: Session,
+    *,
+    text: str,
+    chat_id: str | None,
+    chat_type: str | None,
+    sender_open_id: str | None,
+) -> str | None:
+    if not _is_agent_upload_to_feishu_request(text):
+        return None
+
+    memory = ChatMemoryService(db, chat_id=chat_id, chat_type=chat_type, sender_open_id=sender_open_id)
+    recent = memory.recent_messages(rounds=8)
+    candidates: list[str] = []
+    for item in reversed(recent):
+        if item.role != "assistant":
+            continue
+        for candidate in _extract_local_artifact_candidates(item.content):
+            if candidate not in candidates:
+                candidates.append(candidate)
+        if candidates:
+            break
+
+    resolved_path: Path | None = None
+    for candidate in candidates:
+        resolved_path = _resolve_local_artifact_path(candidate)
+        if resolved_path:
+            break
+
+    if not resolved_path:
+        return (
+            "我没有在当前会话最近的 Agent 产物里找到可上传的本地文件。"
+            "请把本地文件路径直接发给我，或者先让我生成/给出具体文件路径后再说“存到飞书”。"
+        )
+
+    workspace = FeishuWorkspaceService()
+    target_folder = _extract_drive_folder_token(text, workspace=workspace)
+    upload, resolved_folder = await workspace.upload_file_with_fallback(
+        target_folder=target_folder,
+        name=resolved_path.name,
+        content=resolved_path.read_bytes(),
+    )
+    file_token = _extract_feishu_file_token(upload)
+    file_url = _extract_feishu_file_url(upload)
+    if not file_url and file_token:
+        file_url = _feishu_file_url(file_token)
+    if not file_url:
+        raise RuntimeError("飞书上传返回成功，但没有拿到可用的文件链接。")
+    location = "指定文件夹" if target_folder else "飞书“AI生成”文件夹"
+    return "\n".join(
+        [
+            f"已存到飞书 `{location}`，并确认上传成功。",
+            "",
+            f"- 文件：`{resolved_path.name}`",
+            f"- 链接：[打开文件]({file_url})",
+            f"- 目录 token：`{resolved_folder}`",
+        ]
+    )
 
 
 def _parse_chatbot_model_command(text: str) -> str | None:
@@ -584,33 +1078,56 @@ async def _chatbot_reply(
     chat_id: str | None,
     chat_type: str | None,
     sender_open_id: str | None,
+    source_message_id: str | None = None,
+    progress_notifier: Callable[[str], Awaitable[None]] | None = None,
+    request_context: ChatRequestContext | None = None,
 ) -> str:
-    project = ProjectService(db).latest_for_chat(chat_id)
     preferences = ChatPreferenceService(db)
-    preferred_model = preferences.get_chatbot_text_model(
-        chat_id=chat_id,
-        chat_type=chat_type,
-        sender_open_id=sender_open_id,
-    )
     assistant_mode = preferences.get_assistant_mode(
         chat_id=chat_id,
         chat_type=chat_type,
         sender_open_id=sender_open_id,
     )
-    model = str(preferred_model or ((project.workflow_config or {}).get("chatbot_text_model") if project else None) or _default_chatbot_text_model())
-    memory = ChatMemoryService(db, chat_id=chat_id, chat_type=chat_type, sender_open_id=sender_open_id)
     normalized_text = text.strip()
-    messages = [{"role": "system", "content": _chatbot_system_prompt(project=project, session_type=memory.session_type, active_model=model, assistant_mode=assistant_mode)}]
+    _assert_request_current(request_context)
+
+    if assistant_mode == ASSISTANT_MODE_AGENT:
+        memory = ChatMemoryService(db, chat_id=chat_id, chat_type=chat_type, sender_open_id=sender_open_id)
+        reply = await _agent_reply(
+            db,
+            text=normalized_text,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+            source_message_id=source_message_id,
+            request_context=request_context,
+        )
+        _assert_request_current(request_context)
+        reply = _normalize_assistant_reply(reply)
+        memory.append_turn(user_text=normalized_text, assistant_text=reply)
+        db.commit()
+        return reply
+
+    preferred_model = preferences.get_chatbot_text_model(
+        chat_id=chat_id,
+        chat_type=chat_type,
+        sender_open_id=sender_open_id,
+    )
+    model = str(preferred_model or _default_chatbot_text_model())
+    memory = ChatMemoryService(db, chat_id=chat_id, chat_type=chat_type, sender_open_id=sender_open_id)
+    messages = [{"role": "system", "content": _chatbot_system_prompt(session_type=memory.session_type, active_model=model, assistant_mode=assistant_mode)}]
     messages.extend(memory.as_llm_messages())
     messages.append({"role": "user", "content": normalized_text})
 
     if assistant_mode == ASSISTANT_MODE_DEEP_RESEARCH:
         reply = await _deep_research_reply(
-            project=None,
             query=normalized_text,
             messages=messages,
             active_model=model,
+            progress_notifier=progress_notifier,
+            request_context=request_context,
         )
+        _assert_request_current(request_context)
         memory.append_turn(user_text=normalized_text, assistant_text=reply)
         preferences.set_assistant_mode(
             chat_id=chat_id,
@@ -621,31 +1138,214 @@ async def _chatbot_reply(
         db.commit()
         return reply
 
-    if model.startswith("deepseek-v4") and settings.deepseek_api_key and _chatbot_should_search(model=model, text=normalized_text, assistant_mode=assistant_mode):
-        messages = await _inject_web_search_context(messages, query=normalized_text)
-
-    if model.startswith("qwen") and settings.dashscope_api_key:
-        reply = await _dashscope_chat(model=model, messages=messages)
-    elif model.startswith("deepseek-v4") and settings.deepseek_api_key:
-        reply = await _deepseek_chat(model=model, messages=messages)
-    elif _chatbot_uses_openrouter(model) and settings.openrouter_api_key:
-        reply = await _openrouter_chat(
-            model=model,
+    if assistant_mode == ASSISTANT_MODE_STORYBOARD_BREAKDOWN:
+        reply = await _storyboard_breakdown_reply(
+            query=normalized_text,
             messages=messages,
-            enable_web_search=_chatbot_openrouter_web_search_enabled(model) and _chatbot_should_search(
-                model=model,
-                text=normalized_text,
-                assistant_mode=assistant_mode,
-            ),
+            active_model=model,
+            progress_notifier=progress_notifier,
+            request_context=request_context,
         )
-    elif model.startswith("gpt") and settings.openai_api_key:
-        reply = await _openai_chat(model=model, messages=messages)
-    else:
-        reply = "我可以继续帮你梳理问题、给建议，或者你也可以发 `/help` 看可用命令。"
+        _assert_request_current(request_context)
+        memory.append_turn(user_text=normalized_text, assistant_text=reply)
+        preferences.set_assistant_mode(
+            chat_id=chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+            mode=ASSISTANT_MODE_CHAT,
+        )
+        db.commit()
+        return reply
+
+    reply = await _generate_chat_response(
+        model=model,
+        messages=messages,
+        text=normalized_text,
+        assistant_mode=assistant_mode,
+    )
+    _assert_request_current(request_context)
+    reply = _normalize_assistant_reply(reply)
 
     memory.append_turn(user_text=normalized_text, assistant_text=reply)
     db.commit()
     return reply
+
+
+async def _reply_with_timeout_hint(
+    db: Session,
+    *,
+    text: str,
+    chat_id: str | None,
+    chat_type: str | None,
+    sender_open_id: str | None,
+    source_message_id: str | None = None,
+    progress_notifier: Callable[[str], Awaitable[None]] | None,
+    hint_enabled: bool,
+    feishu: FeishuClient,
+    request_context: ChatRequestContext | None,
+) -> str:
+    reply_task = asyncio.create_task(
+        _chatbot_reply(
+            db,
+            text=text,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+            source_message_id=source_message_id,
+            progress_notifier=progress_notifier,
+            request_context=request_context,
+        )
+    )
+    if not hint_enabled or not chat_id:
+        return await reply_task
+    done, _ = await asyncio.wait({reply_task}, timeout=300)
+    if done:
+        return await reply_task
+    if not _is_request_current(request_context):
+        raise StaleChatRequest("stale chat request")
+    await feishu.send_text(
+        chat_id,
+        "普通助手超过 5 分钟仍未回复。你可以稍后重试；如果本次最终失败，我会继续返回具体原因。",
+    )
+    return await reply_task
+
+
+async def _generate_chat_response(
+    *,
+    model: str,
+    messages: list[dict[str, str]],
+    text: str,
+    assistant_mode: str,
+) -> str:
+    if model.startswith("deepseek-v4") and settings.deepseek_api_key and _chatbot_should_search(model=model, text=text, assistant_mode=assistant_mode):
+        messages = await _inject_web_search_context(messages, query=text)
+
+    if model.startswith("qwen") and settings.dashscope_api_key:
+        return await _dashscope_chat(model=model, messages=messages)
+    if model.startswith("deepseek-v4") and settings.deepseek_api_key:
+        return await _deepseek_chat(model=model, messages=messages)
+    if _chatbot_uses_openrouter(model) and settings.openrouter_api_key:
+        return await _openrouter_chat(
+            model=model,
+            messages=messages,
+            enable_web_search=_chatbot_openrouter_web_search_enabled(model) and _chatbot_should_search(
+                model=model,
+                text=text,
+                assistant_mode=assistant_mode,
+            ),
+        )
+    if model.startswith("gpt") and settings.openai_api_key:
+        return await _openai_chat(model=model, messages=messages)
+    return "我可以继续帮你梳理问题、给建议，或者你也可以发 `/help` 看可用命令。"
+
+
+def _chatbot_failure_message(exc: Exception) -> str:
+    reason = str(exc).strip() or type(exc).__name__
+    if len(reason) > 500:
+        reason = reason[:497] + "..."
+    return f"本次请求处理失败，请重试。\n原因：`{reason}`"
+
+
+def _split_reply_for_streaming(content: str) -> list[str]:
+    normalized = (content or "").strip()
+    if not normalized:
+        return ["我暂时没有生成有效回复。"]
+    if len(normalized) <= STREAM_REPLY_MAX_CHARS:
+        return [normalized]
+
+    paragraphs = [part.strip() for part in re.split(r"\n{2,}", normalized) if part.strip()]
+    chunks: list[str] = []
+    current = ""
+
+    def flush() -> None:
+        nonlocal current
+        if current.strip():
+            chunks.append(current.strip())
+        current = ""
+
+    for paragraph in paragraphs:
+        candidate = f"{current}\n\n{paragraph}".strip() if current else paragraph
+        if len(candidate) <= STREAM_REPLY_TARGET_CHARS:
+            current = candidate
+            continue
+        if current:
+            flush()
+        if len(paragraph) <= STREAM_REPLY_MAX_CHARS:
+            current = paragraph
+            continue
+        units = re.split(r"(?<=[。！？!?；;])\s*|\n", paragraph)
+        local = ""
+        for unit in [item.strip() for item in units if item.strip()]:
+            candidate_local = f"{local}\n{unit}".strip() if local else unit
+            if len(candidate_local) <= STREAM_REPLY_MAX_CHARS:
+                local = candidate_local
+                continue
+            if local:
+                chunks.append(local.strip())
+                local = ""
+            if len(unit) <= STREAM_REPLY_MAX_CHARS:
+                local = unit
+                continue
+            start = 0
+            while start < len(unit):
+                chunks.append(unit[start : start + STREAM_REPLY_MAX_CHARS].strip())
+                start += STREAM_REPLY_MAX_CHARS
+        if local:
+            current = local
+        else:
+            current = ""
+    flush()
+    return chunks or [normalized]
+
+
+async def _send_reply_segmented(
+    *,
+    feishu: FeishuClient,
+    target_chat: str,
+    content: str,
+    title: str,
+    chat_id: str | None,
+    chat_type: str | None,
+    sender_open_id: str | None,
+    request_context: ChatRequestContext | None,
+) -> int:
+    chunks = _split_reply_for_streaming(content)
+    sent = 0
+    try:
+        for index, chunk in enumerate(chunks, start=1):
+            _assert_request_current(request_context)
+            chunk_title = title if len(chunks) == 1 else f"{title}（{index}/{len(chunks)}）"
+            await feishu.send_card(
+                target_chat,
+                chatbot_reply_card(
+                    content=chunk,
+                    title=chunk_title,
+                    chat_id=chat_id,
+                    chat_type=chat_type,
+                    sender_open_id=sender_open_id,
+                    include_actions=index == len(chunks),
+                ),
+            )
+            sent += 1
+        return sent
+    except StaleChatRequest:
+        raise
+    except Exception:
+        _assert_request_current(request_context)
+        if sent:
+            await feishu.send_text(target_chat, "分段发送中断，下面补发完整回复。")
+        await feishu.send_card(
+            target_chat,
+            chatbot_reply_card(
+                content=content,
+                title=title,
+                chat_id=chat_id,
+                chat_type=chat_type,
+                sender_open_id=sender_open_id,
+                include_actions=True,
+            ),
+        )
+        return sent + 1
 
 
 async def _handle_direct_generation_command(
@@ -663,6 +1363,7 @@ async def _handle_direct_generation_command(
                 target_chat,
                 chatbot_reply_card(
                     content=_direct_command_help(command.kind),
+                    chat_id=target_chat,
                     chat_type=chat_type,
                     sender_open_id=sender_open_id,
                 ),
@@ -751,7 +1452,7 @@ async def _handle_direct_generation_command(
         if target_chat:
             await feishu.send_card(
                 target_chat,
-                chatbot_reply_card(content=content, chat_type=chat_type, sender_open_id=sender_open_id),
+                chatbot_reply_card(content=content, chat_id=target_chat, chat_type=chat_type, sender_open_id=sender_open_id),
             )
         return {"message": "直接生成已完成", "data": {"kind": command.kind, "model": command.model}}
     except Exception as exc:
@@ -766,6 +1467,7 @@ async def _handle_direct_generation_command(
                             f"- 原因：`{str(exc)}`",
                         ]
                     ),
+                    chat_id=target_chat,
                     chat_type=chat_type,
                     sender_open_id=sender_open_id,
                 ),
@@ -891,6 +1593,12 @@ def _extract_feishu_file_token(response: dict) -> str:
     return str(data.get("file_token") or data.get("file", {}).get("file_token") or "")
 
 
+def _extract_feishu_file_url(response: dict) -> str:
+    data = response.get("data", {})
+    file_data = data.get("file") or {}
+    return str(data.get("url") or file_data.get("url") or "")
+
+
 def _feishu_file_url(file_token: str) -> str:
     domain = settings.feishu_base_url.replace("https://open.", "").replace("http://open.", "")
     return f"https://{domain}/file/{file_token}"
@@ -940,6 +1648,10 @@ def _chatbot_openrouter_web_search_enabled(model: str) -> bool:
 def _chatbot_should_search(*, model: str, text: str, assistant_mode: str) -> bool:
     if assistant_mode == ASSISTANT_MODE_DEEP_RESEARCH:
         return True
+    if assistant_mode == ASSISTANT_MODE_AGENT:
+        return False
+    if assistant_mode == ASSISTANT_MODE_STORYBOARD_BREAKDOWN:
+        return False
     normalized = (text or "").strip().lower()
     keywords = (
         "最新",
@@ -964,20 +1676,7 @@ def _chatbot_should_search(*, model: str, text: str, assistant_mode: str) -> boo
     return any(keyword in normalized for keyword in keywords)
 
 
-def _chatbot_system_prompt(*, project: Project | None, session_type: str, active_model: str, assistant_mode: str) -> str:
-    workflow_config = project.workflow_config if project else {}
-    model_config = project.model_config if project else {}
-    project_summary = (
-        f"当前绑定项目：{project.name}。画幅：{workflow_config.get('aspect_ratio', '16:9')}。"
-        f"时长：{workflow_config.get('duration_seconds', 5)} 秒。"
-        f"关键帧生成：{'已开启' if workflow_config.get('keyframe_generation_enabled') else '未开启'}。"
-        f"首尾帧同步：{'已开启' if workflow_config.get('transition_alignment_enabled') else '未开启'}。"
-        f"默认模型：文本 {((model_config.get('text') or {}).get('model_id') or _default_chatbot_text_model())}，"
-        f"图片 {((model_config.get('image') or {}).get('model_id') or _default_chatbot_image_model())}，"
-        f"视频 {((model_config.get('video') or {}).get('model_id') or _default_chatbot_video_model())}。"
-        if project
-        else "当前会话还没有绑定分镜项目；如果用户要开始项目，请引导他发送 `/新建分镜项目：项目名`。"
-    )
+def _chatbot_system_prompt(*, session_type: str, active_model: str, assistant_mode: str) -> str:
     session_summary = "当前会话是私聊，上下文只属于当前私聊用户。" if session_type == "private" else "当前会话是群聊，上下文属于当前群聊。"
     capability_summary = _chatbot_capability_summary()
     web_search_summary = (
@@ -990,6 +1689,12 @@ def _chatbot_system_prompt(*, project: Project | None, session_type: str, active
             "除此之外，要明确说明你无法自行联网，只能基于已有上下文给建议。"
         )
     )
+    if assistant_mode == ASSISTANT_MODE_AGENT:
+        return (
+            "你现在处于 Agent 模式。这个模式下的实际执行由外部 Codex Agent 负责，"
+            "当前普通聊天提示词不应接管这一轮回复。"
+            f"\n{session_summary}"
+        )
     if assistant_mode == ASSISTANT_MODE_DEEP_RESEARCH:
         return (
             "你现在处于 Deep Research 助手模式。"
@@ -997,6 +1702,27 @@ def _chatbot_system_prompt(*, project: Project | None, session_type: str, active
             "不要把当前对话当成飞书分镜项目的一部分，也不要主动提及项目、镜号、图片/视频工作流，除非用户明确要求把研究结果转成分镜。"
             f"{web_search_summary}\n"
             "回答要求：中文优先，尽量结构化；事实不确定时明确标注“待验证”；最终重点是完整研究内容，而不是只返回来源列表。"
+            f"\n{session_summary}"
+        )
+    if assistant_mode == ASSISTANT_MODE_STORYBOARD_BREAKDOWN:
+        return (
+            "你现在处于分镜拆解模式。"
+            "你的职责是读取用户提供的飞书云文档、飞书文件或正文材料，把内容拆解成可执行的分镜需求。"
+            "你要输出结构化中文 Markdown，重点不是生成最终视频，而是把原始需求转成分镜规划。"
+            "不要把当前对话绑定到现有飞书分镜项目，也不要假装已经创建项目、生成图片或生成视频。"
+            "除非系统明确告诉你某个文档已经存在历史拆解记录，否则不要擅自声称“这个文档之前已经拆解过”。"
+            "如果用户发来了文档链接或文件，而你判断应该进入拆解流程，就直接继续拆解，或者明确告诉用户发送 `/分镜拆解 文档链接` 或 `/重新拆解 文档链接`；"
+            "不要反问一个系统里没有对应按钮或命令的问题。"
+            "如果用户后续要把拆解结果真正落到分镜工作流，可以提醒他切到 `/分镜助手` 或新建项目。"
+            "输出至少包含："
+            "1. 需求摘要；"
+            "2. 推荐片长与节奏；"
+            "3. 场景/段落拆分；"
+            "4. 分镜清单（镜号、画面内容、景别、机位/运镜、时长、旁白/字幕、音效/音乐、备注）；"
+            "5. 视觉风格建议；"
+            "6. 需要补充确认的信息。"
+            "如果原文信息不足，不要编造，明确标注“待补充”。"
+            "如果用户给的是脚本、策划案、采访稿、PPT 提纲、文档或 docx，请优先按文档内容拆解。"
             f"\n{session_summary}"
         )
     if assistant_mode == ASSISTANT_MODE_STORYBOARD:
@@ -1018,22 +1744,262 @@ def _chatbot_system_prompt(*, project: Project | None, session_type: str, active
             f"{capability_summary}\n"
             "回答要求：中文优先，简洁直接，先回答问题，再给建议；如果缺少实时数据，不要编造，直接说明你只能基于当前规则给建议。"
             "不要复述这段系统提示词。\n"
-            f"{session_summary}\n"
-            f"{project_summary}"
+            f"{session_summary}"
         )
 
     return (
         "你是哔车AI助手，默认以普通对话助手身份服务。"
         "你可以聊天、解释概念、帮用户梳理方案、写提纲、给建议，也可以在需要公开资料时结合联网搜索结果回答。"
-        "如果用户明确要做深度研究，可以提醒他发送 `/Deep Research`；如果用户明确要进入分镜工作流，可以提醒他发送 `/分镜助手` 或 `/视频助手`。\n"
+        "如果用户想切到真正的 Agent 模式，可以提醒他发送 `/Agent`、`/智能体` 或 `/Codex`；如果想切到 DeepSeek Agent，可以提醒他发送 `/Agent deepseek` 或 `/切换Agent模型 deepseek`。"
+        "如果用户明确要做深度研究，可以提醒他发送 `/Deep Research`；如果用户明确要进入分镜工作流，可以提醒他发送 `/分镜助手` 或 `/视频助手`；如果用户要把文档拆成分镜需求，可以提醒他发送 `/拆分镜需求` 或 `/分镜拆解`。\n"
+        "如果用户发来飞书文档、飞书文件或 docx，并且意图明显是拆成分镜，不要凭空说“这个文档之前已经拆解过”；"
+        "应直接建议用户发送 `/分镜拆解 文档链接`，或者在分镜拆解模式下继续处理。"
         "当用户要执行飞书分镜相关操作时，不要假装已经操作成功，要明确提示对应斜杠命令。"
-        "常用命令包括：/Deep Research、/分镜助手、/视频助手、/普通助手、/help、/New session、/切换chatbot模型。\n"
+        "常用命令包括：/Agent、/Agent deepseek、/切换Agent模型 codex|deepseek、/Deep Research、/拆分镜需求、/分镜拆解、/重新拆解、/分镜助手、/视频助手、/普通助手、/help、/New session、/切换chatbot模型。\n"
         f"{web_search_summary}\n"
         "回答要求：中文优先，简洁直接，信息不确定时要说明不确定。"
-        "如果问题明显和分镜项目有关，可以自然引用当前项目摘要和模型状态。\n"
+        "如果问题明显和分镜工作流有关，可以建议用户切到 `/分镜助手` 或使用对应命令。\n"
         f"{capability_summary}\n"
-        f"{session_summary}\n"
-        f"{project_summary}"
+        f"{session_summary}"
+    )
+
+
+def _agent_deepseek_system_prompt(*, session_type: str) -> str:
+    session_summary = "当前会话是私聊，上下文只属于当前私聊用户。" if session_type == "private" else "当前会话是群聊，上下文只属于当前群聊。"
+    return (
+        "你现在是哔车AI助手的 Agent（DeepSeek）模式。"
+        "你的目标是像一个可靠的执行型助手一样思考和回答：先理解用户意图，再给出清晰结论、步骤、风险和下一步建议。"
+        "你没有 Codex 的本地工具和代码执行能力，不要假装已经查了本地代码、跑了命令、改了文件或操作了飞书。"
+        "如果用户明确要使用当前项目已有功能，要优先指向现有命令和体系，而不是自己模拟："
+        "分镜工作流用 `/分镜助手` 或 `/视频助手`；深度研究用 `/Deep Research`；分镜拆解用 `/分镜拆解`；普通聊天用 `/普通助手`。"
+        "如果用户是在排查这些功能的逻辑、报错或实现细节，你可以解释已知规则，但要明确说明你当前不能直接读取本地代码。"
+        "回答要求：中文优先，直接、结构化、别装作已经执行成功。"
+        f"\n{session_summary}"
+    )
+
+
+def _openclaw_agent_session_id(
+    *,
+    chat_id: str | None,
+    chat_type: str | None,
+    sender_open_id: str | None,
+    nonce: int,
+) -> str:
+    session = resolve_chat_session(chat_id=chat_id, chat_type=chat_type, sender_open_id=sender_open_id)
+    digest = hashlib.sha1(f"{session.session_key}:{nonce}".encode("utf-8")).hexdigest()[:24]
+    return f"feishu-agent-{digest}"
+
+
+def _openclaw_agent_session_file(session_id: str) -> Path:
+    return Path.home() / ".openclaw" / "agents" / "main" / "sessions" / f"{session_id}.jsonl"
+
+
+def _compose_openclaw_agent_message(
+    *,
+    session_id: str,
+    memory: ChatMemoryService,
+    text: str,
+) -> str:
+    if _openclaw_agent_session_file(session_id).exists():
+        return text
+    recent = memory.recent_messages(rounds=4)
+    if not recent:
+        return text
+    lines = ["会话延续上下文（仅供续接当前任务，不要逐字复述）："]
+    for item in recent:
+        role = "用户" if item.role == "user" else "助手"
+        content = (item.content or "").strip()
+        if not content:
+            continue
+        if len(content) > 500:
+            content = content[:497] + "..."
+        lines.append(f"{role}：{content}")
+    lines.append("")
+    lines.append(f"当前新请求：{text}")
+    return "\n".join(lines).strip()
+
+
+async def _run_openclaw_agent(
+    *,
+    session_id: str,
+    message: str,
+    timeout_seconds: int = 600,
+    session_key: str | None = None,
+    model: str | None = None,
+) -> dict[str, Any]:
+    binary = shutil.which("openclaw")
+    if not binary:
+        raise RuntimeError("OpenClaw 未安装或不在 PATH 中。")
+    args = [
+        binary,
+        "agent",
+        "--session-id",
+        session_id,
+        "--message",
+        message,
+        "--json",
+        "--timeout",
+        str(timeout_seconds),
+    ]
+    if model:
+        args.extend(["--model", model])
+    process = await asyncio.create_subprocess_exec(
+        *args,
+        stdout=asyncio.subprocess.PIPE,
+        stderr=asyncio.subprocess.PIPE,
+    )
+    if session_key:
+        _ACTIVE_OPENCLAW_PROCESSES[session_key] = process
+    try:
+        stdout, stderr = await process.communicate()
+        if process.returncode != 0:
+            reason = (stderr.decode("utf-8", errors="ignore").strip() or stdout.decode("utf-8", errors="ignore").strip() or "unknown error")
+            raise RuntimeError(f"OpenClaw Agent 执行失败：{reason}")
+        payload = json.loads(stdout.decode("utf-8", errors="ignore") or "{}")
+        if not isinstance(payload, dict):
+            raise RuntimeError("OpenClaw Agent 返回了无法识别的结果。")
+        return payload
+    finally:
+        if session_key and _ACTIVE_OPENCLAW_PROCESSES.get(session_key) is process:
+            _ACTIVE_OPENCLAW_PROCESSES.pop(session_key, None)
+
+
+def _extract_openclaw_agent_reply(payload: dict[str, Any]) -> str:
+    candidates: list[str] = []
+    if isinstance(payload.get("reply"), str):
+        candidates.append(payload["reply"])
+    if isinstance(payload.get("content"), str):
+        candidates.append(payload["content"])
+    result = payload.get("result")
+    if isinstance(result, dict):
+        for key in ("finalAssistantVisibleText", "finalAssistantRawText"):
+            value = result.get(key)
+            if isinstance(value, str):
+                candidates.append(value)
+        for key in ("reply", "content", "text", "message"):
+            value = result.get(key)
+            if isinstance(value, str):
+                candidates.append(value)
+        payloads = result.get("payloads")
+        if isinstance(payloads, list):
+            for item in payloads:
+                if isinstance(item, dict):
+                    text = item.get("text")
+                    if isinstance(text, str):
+                        candidates.append(text)
+    messages = payload.get("messages")
+    if isinstance(messages, list):
+        for item in reversed(messages):
+            if isinstance(item, dict):
+                role = str(item.get("role") or "").lower()
+                if role in {"assistant", "model"}:
+                    content = item.get("content") or item.get("text") or item.get("message")
+                    if isinstance(content, str):
+                        candidates.append(content)
+                        break
+    for candidate in candidates:
+        normalized = _normalize_assistant_reply(candidate)
+        if normalized:
+            return normalized
+    raise RuntimeError("OpenClaw Agent 没有返回可发送的文本结果。")
+
+
+async def _agent_reply_via_openclaw(
+    db: Session,
+    *,
+    text: str,
+    chat_id: str | None,
+    chat_type: str | None,
+    sender_open_id: str | None,
+    source_message_id: str | None,
+    model_override: str | None = None,
+    request_context: ChatRequestContext | None = None,
+) -> str:
+    preferences = ChatPreferenceService(db)
+    memory = ChatMemoryService(db, chat_id=chat_id, chat_type=chat_type, sender_open_id=sender_open_id)
+    session = resolve_chat_session(chat_id=chat_id, chat_type=chat_type, sender_open_id=sender_open_id)
+    nonce = preferences.get_agent_session_nonce(
+        chat_id=chat_id,
+        chat_type=chat_type,
+        sender_open_id=sender_open_id,
+    )
+    session_id = _openclaw_agent_session_id(
+        chat_id=chat_id,
+        chat_type=chat_type,
+        sender_open_id=sender_open_id,
+        nonce=nonce,
+    )
+    feishu = FeishuClient()
+    reaction_id: str | None = None
+    agent_message = _compose_openclaw_agent_message(session_id=session_id, memory=memory, text=text)
+    try:
+        if source_message_id:
+            try:
+                reaction = await feishu.add_message_reaction(source_message_id, "Typing")
+                if isinstance(reaction, dict):
+                    reaction_id = ((reaction.get("data") or {}).get("reaction_id")) or None
+            except Exception:
+                reaction_id = None
+        payload = await _run_openclaw_agent(
+            session_id=session_id,
+            message=agent_message,
+            session_key=session.session_key,
+            model=model_override,
+        )
+        _assert_request_current(request_context)
+        return _extract_openclaw_agent_reply(payload)
+    finally:
+        if source_message_id and reaction_id:
+            try:
+                await feishu.remove_message_reaction(source_message_id, reaction_id)
+            except Exception:
+                pass
+
+
+def _openclaw_agent_model_for_runtime(runtime: str) -> str | None:
+    normalized = _normalize_agent_runtime(runtime)
+    if normalized == AGENT_RUNTIME_DEEPSEEK:
+        model = str(settings.deepseek_text_model or "").strip()
+        if model and "/" not in model:
+            return f"deepseek/{model}"
+        return model or "deepseek/deepseek-v4-pro"
+    return None
+
+
+async def _agent_reply(
+    db: Session,
+    *,
+    text: str,
+    chat_id: str | None,
+    chat_type: str | None,
+    sender_open_id: str | None,
+    source_message_id: str | None,
+    request_context: ChatRequestContext | None = None,
+) -> str:
+    uploaded = await _agent_upload_recent_artifact_to_feishu(
+        db,
+        text=text,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        sender_open_id=sender_open_id,
+    )
+    if uploaded:
+        return uploaded
+
+    runtime = ChatPreferenceService(db).get_agent_runtime(
+        chat_id=chat_id,
+        chat_type=chat_type,
+        sender_open_id=sender_open_id,
+    )
+    return await _agent_reply_via_openclaw(
+        db,
+        text=text,
+        chat_id=chat_id,
+        chat_type=chat_type,
+        sender_open_id=sender_open_id,
+        source_message_id=source_message_id,
+        model_override=_openclaw_agent_model_for_runtime(runtime),
+        request_context=request_context,
     )
 
 
@@ -1062,16 +2028,28 @@ def _chatbot_capability_summary() -> str:
 
 async def _deep_research_reply(
     *,
-    project: Project | None,
     query: str,
     messages: list[dict[str, str]],
     active_model: str,
+    progress_notifier: Callable[[str], Awaitable[None]] | None = None,
+    request_context: ChatRequestContext | None = None,
 ) -> str:
     references = await _load_feishu_references_from_text(query)
+    workspace = FeishuWorkspaceService()
+    destination_folder_token = _extract_drive_folder_token(query, workspace=workspace)
     report_markdown = ""
+    raw_text = ""
+    raw_payload: Any | None = None
     execution_path = ""
     fallback_reason = ""
     errors: list[str] = []
+    if progress_notifier:
+        destination_hint = "指定文件夹" if destination_folder_token else "默认 Deep Research 文件夹"
+        await progress_notifier(
+            "已开始 Deep Research，正在检索和整理资料。"
+            "这类任务通常需要数分钟；如果 Gemini 长时间处于 in_progress，系统会每 5 分钟同步一次进度，并在约 40 分钟后自动回退到备用路径。"
+            f"当前输出位置：{destination_hint}。"
+        )
     primary_attempts: list[tuple[str, str, Any]] = []
     if settings.google_api_key:
         primary_attempts.append(
@@ -1101,26 +2079,51 @@ async def _deep_research_reply(
         errors.append("No Deep Research primary provider configured")
     for label, path_label, runner in primary_attempts:
         try:
-            report_markdown = await runner(query=query, references=references, project=project)
+            result = await runner(
+                query=query,
+                references=references,
+                progress_notifier=progress_notifier,
+            )
+            normalized = _normalize_deep_research_result(result)
+            report_markdown = normalized.markdown
+            raw_text = normalized.raw_text
+            raw_payload = normalized.raw_payload
             execution_path = path_label
             break
         except Exception as exc:
             errors.append(_format_research_error(label, exc))
     if not execution_path:
-        report_markdown = await _fallback_research_report(
+        fallback_result = await _fallback_research_report(
             query=query,
             references=references,
             active_model=active_model,
             messages=messages,
         )
+        normalized = _normalize_deep_research_result(fallback_result)
+        report_markdown = normalized.markdown
+        raw_text = normalized.raw_text
+        raw_payload = normalized.raw_payload
         execution_path = f"Fallback 搜索总结（{active_model}）"
         fallback_reason = "；".join(item for item in errors if item)[:400]
 
-    workspace = FeishuWorkspaceService()
+    _assert_request_current(request_context)
+    document_title = f"Deep Research_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     saved_doc = await workspace.save_markdown_document(
-        title=f"Deep Research_{datetime.now().strftime('%Y%m%d_%H%M%S')}",
+        title=document_title,
         markdown=report_markdown,
-        folder_token=settings.feishu_root_folder_token,
+        folder_token=destination_folder_token,
+    )
+    raw_dump = _deep_research_raw_dump(
+        query=query,
+        execution_path=execution_path,
+        report_markdown=report_markdown,
+        raw_text=raw_text,
+        raw_payload=raw_payload,
+    )
+    raw_file = await workspace.save_text_file(
+        filename=f"{document_title}_raw.txt",
+        text=raw_dump,
+        folder_token=saved_doc.folder_token,
     )
     meta_lines = [
         "**研究执行路径**",
@@ -1132,12 +2135,71 @@ async def _deep_research_reply(
         f"{chr(10).join(meta_lines)}\n\n"
         f"{report_markdown}\n\n"
         f"**已保存飞书文档**\n"
-        f"- [打开研究文档]({saved_doc.url})"
+        f"- [打开研究文档]({saved_doc.url})\n"
+        f"- [打开原始返回文本]({raw_file.url})"
+    )
+
+
+async def _storyboard_breakdown_reply(
+    *,
+    query: str,
+    messages: list[dict[str, str]],
+    active_model: str,
+    progress_notifier: Callable[[str], Awaitable[None]] | None = None,
+    request_context: ChatRequestContext | None = None,
+) -> str:
+    references = await _load_feishu_references_from_text(query)
+    workspace = FeishuWorkspaceService()
+    destination_folder_token = _extract_drive_folder_token(query, workspace=workspace)
+    if not destination_folder_token:
+        storyboard_folder = await workspace.ensure_storyboard_workspace_folder()
+        destination_folder_token = str(storyboard_folder.get("folder_token") or "")
+    if progress_notifier:
+        await progress_notifier(
+            "已开始分镜拆解，正在读取文档并整理镜头需求。"
+            "如果你给的是飞书云文档或文件链接，我会优先按文档内容拆解，并在完成后保存为飞书文档。"
+        )
+    prompt = _storyboard_breakdown_prompt(query=query, references=references)
+    breakdown_messages = list(messages[:-1])
+    breakdown_messages.append({"role": "user", "content": prompt})
+    markdown = await _generate_chat_response(
+        model=active_model,
+        messages=breakdown_messages,
+        text=query,
+        assistant_mode=ASSISTANT_MODE_STORYBOARD_BREAKDOWN,
+    )
+    normalized = _normalize_deep_research_result(markdown)
+    _assert_request_current(request_context)
+    document_title = f"分镜拆解_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
+    saved_doc = await workspace.save_markdown_document(
+        title=document_title,
+        markdown=normalized.markdown,
+        folder_token=destination_folder_token,
+    )
+    raw_dump = _deep_research_raw_dump(
+        query=query,
+        execution_path=f"Storyboard Breakdown（{active_model}）",
+        report_markdown=normalized.markdown,
+        raw_text=normalized.raw_text,
+        raw_payload=normalized.raw_payload,
+    )
+    raw_file = await workspace.save_text_file(
+        filename=f"{document_title}_raw.txt",
+        text=raw_dump,
+        folder_token=saved_doc.folder_token,
+    )
+    return (
+        "**分镜拆解已完成**\n"
+        f"- 模型：`{active_model}`\n"
+        f"- 文档来源：{len(references)} 份\n\n"
+        f"**已保存飞书文档**\n"
+        f"- [打开拆解文档]({saved_doc.url})\n"
+        f"- [打开原始返回文本]({raw_file.url})"
     )
 
 
 async def _load_feishu_references_from_text(text: str) -> list[dict]:
-    urls = re.findall(r"(https?://\S+|feishu://[^\s]+)", text or "")
+    urls = _extract_message_urls(text)
     if not urls:
         return []
     workspace = FeishuWorkspaceService()
@@ -1150,10 +2212,47 @@ async def _load_feishu_references_from_text(text: str) -> list[dict]:
     return references
 
 
-async def _openai_deep_research_report(*, query: str, references: list[dict], project: Project | None) -> str:
+def _extract_drive_folder_token(text: str, *, workspace: FeishuWorkspaceService) -> str | None:
+    urls = [url for url in _extract_message_urls(text) if "/drive/folder/" in url]
+    for url in urls:
+        token = workspace.folder_token_from_url(url)
+        if token:
+            return token
+    return None
+
+
+def _extract_message_urls(text: str | None) -> list[str]:
+    raw = str(text or "")
+    urls: list[str] = []
+    for url in re.findall(r"\((https?://[^\s)]+)\)", raw):
+        urls.append(_sanitize_message_url(url))
+    for url in re.findall(r"(https?://\S+|feishu://[^\s]+)", raw):
+        cleaned = _sanitize_message_url(url)
+        if cleaned:
+            urls.append(cleaned)
+    return list(dict.fromkeys(url for url in urls if url))
+
+
+def _sanitize_message_url(url: str) -> str:
+    cleaned = str(url or "").strip()
+    if not cleaned:
+        return ""
+    while cleaned and cleaned[-1] in ").,;!?>]}\"'":
+        cleaned = cleaned[:-1]
+    while cleaned and cleaned[0] in "(<[{\"'":
+        cleaned = cleaned[1:]
+    return cleaned.strip()
+
+
+async def _openai_deep_research_report(
+    *,
+    query: str,
+    references: list[dict],
+    progress_notifier: Callable[[str], Awaitable[None]] | None = None,
+) -> DeepResearchResult:
     if not settings.openai_api_key:
         raise RuntimeError("OPENAI_API_KEY is required")
-    prompt = _deep_research_prompt(query=query, references=references, project=project)
+    prompt = _deep_research_prompt(query=query, references=references)
     body = {
         "model": settings.openai_deep_research_model,
         "input": prompt,
@@ -1167,13 +2266,23 @@ async def _openai_deep_research_report(*, query: str, references: list[dict], pr
             json=body,
         )
     response.raise_for_status()
-    return _format_openai_research_response(response.json())
+    data = response.json()
+    return DeepResearchResult(
+        markdown=_format_openai_research_response(data),
+        raw_text=str(data.get("output_text") or "").strip(),
+        raw_payload=data,
+    )
 
 
-async def _google_deep_research_report(*, query: str, references: list[dict], project: Project | None) -> str:
+async def _google_deep_research_report(
+    *,
+    query: str,
+    references: list[dict],
+    progress_notifier: Callable[[str], Awaitable[None]] | None = None,
+) -> DeepResearchResult:
     if not settings.google_api_key:
         raise RuntimeError("GOOGLE_API_KEY is required")
-    prompt = _deep_research_prompt(query=query, references=references, project=project)
+    prompt = _deep_research_prompt(query=query, references=references)
     body = {
         "input": prompt,
         "agent": settings.google_deep_research_model,
@@ -1195,7 +2304,8 @@ async def _google_deep_research_report(*, query: str, references: list[dict], pr
         interaction_id = str(interaction.get("id") or "").strip()
         if not interaction_id:
             raise RuntimeError("Gemini Deep Research did not return an interaction id")
-        for _ in range(settings.google_deep_research_max_poll_attempts):
+        progress_every = max(1, 300 // settings.google_deep_research_poll_interval_seconds)
+        for attempt in range(settings.google_deep_research_max_poll_attempts):
             poll_response = await client.get(f"{base_url}/v1beta/interactions/{interaction_id}", headers=headers)
             poll_response.raise_for_status()
             interaction = poll_response.json()
@@ -1205,17 +2315,30 @@ async def _google_deep_research_report(*, query: str, references: list[dict], pr
             if status in {"failed", "cancelled", "canceled"}:
                 error_message = _google_interaction_error(interaction) or f"interaction status={status}"
                 raise RuntimeError(error_message)
+            if progress_notifier and attempt >= 0 and (attempt + 1) % progress_every == 0:
+                waited_seconds = (attempt + 1) * settings.google_deep_research_poll_interval_seconds
+                waited_minutes = max(1, round(waited_seconds / 60))
+                await progress_notifier(
+                    f"Deep Research 仍在进行中：Gemini 当前状态为 `{status or 'in_progress'}`，"
+                    f"已等待约 {waited_minutes} 分钟。若长时间无结果，系统会自动回退到备用路径。"
+                )
             await asyncio.sleep(settings.google_deep_research_poll_interval_seconds)
     raise RuntimeError(
-        "Gemini Deep Research polling timed out "
-        f"after {settings.google_deep_research_max_poll_attempts} attempts"
+        "Gemini Deep Research 超时："
+        f"已等待约 {round(settings.google_deep_research_max_poll_attempts * settings.google_deep_research_poll_interval_seconds / 60)} 分钟，"
+        "仍处于 in_progress，系统将回退到备用路径。"
     )
 
 
-async def _openrouter_deep_research_report(*, query: str, references: list[dict], project: Project | None) -> str:
+async def _openrouter_deep_research_report(
+    *,
+    query: str,
+    references: list[dict],
+    progress_notifier: Callable[[str], Awaitable[None]] | None = None,
+) -> DeepResearchResult:
     if not settings.openrouter_api_key:
         raise RuntimeError("OPENROUTER_API_KEY is required")
-    prompt = _deep_research_prompt(query=query, references=references, project=project)
+    prompt = _deep_research_prompt(query=query, references=references)
     body = {
         "model": settings.openrouter_deep_research_model,
         "messages": [{"role": "user", "content": prompt}],
@@ -1231,7 +2354,12 @@ async def _openrouter_deep_research_report(*, query: str, references: list[dict]
             json=body,
         )
     response.raise_for_status()
-    return _chat_content_from_response(response.json())
+    data = response.json()
+    return DeepResearchResult(
+        markdown=_chat_content_from_response(data),
+        raw_text=_chat_content_from_response(data),
+        raw_payload=data,
+    )
 
 
 async def _fallback_research_report(
@@ -1264,12 +2392,51 @@ async def _fallback_research_report(
     return await _deepseek_chat(model=settings.deepseek_text_model, messages=fallback_messages)
 
 
+def _normalize_deep_research_result(result: DeepResearchResult | str) -> DeepResearchResult:
+    if isinstance(result, DeepResearchResult):
+        return result
+    text = str(result or "").strip()
+    return DeepResearchResult(markdown=text or "我没有生成有效研究结果。", raw_text=text)
+
+
+def _deep_research_raw_dump(
+    *,
+    query: str,
+    execution_path: str,
+    report_markdown: str,
+    raw_text: str,
+    raw_payload: Any | None,
+) -> str:
+    sections = [
+        "=== query ===",
+        query.strip(),
+        "",
+        "=== execution_path ===",
+        execution_path.strip(),
+        "",
+        "=== extracted_markdown ===",
+        (report_markdown or "").strip(),
+        "",
+        "=== raw_text ===",
+        (raw_text or "").strip(),
+        "",
+        "=== raw_payload_json ===",
+    ]
+    if raw_payload is None:
+        sections.append("")
+    elif isinstance(raw_payload, str):
+        sections.append(raw_payload)
+    else:
+        sections.append(json.dumps(raw_payload, ensure_ascii=False, indent=2, default=str))
+    return "\n".join(sections).strip() + "\n"
+
+
 def _format_research_error(label: str, exc: Exception) -> str:
     message = str(exc).strip() or type(exc).__name__
     return f"{label}: {message}"
 
 
-def _deep_research_prompt(*, query: str, references: list[dict], project: Project | None) -> str:
+def _deep_research_prompt(*, query: str, references: list[dict]) -> str:
     return (
         "你是一个专业研究分析师。请围绕用户问题执行 deep research，并输出一份中文 Markdown 报告。\n"
         "要求：\n"
@@ -1279,6 +2446,33 @@ def _deep_research_prompt(*, query: str, references: list[dict], project: Projec
         "4. 在文末给出来源清单，尽量保留可点击链接。\n"
         "5. 如果用户的问题更像研究计划而不是最终结论，请输出可执行的 deep research plan。\n\n"
         f"用户问题：{query}\n\n"
+        f"已提供文件内容（JSON 或文本）：\n{_reference_context_block(references)}"
+    )
+
+
+def _normalize_assistant_reply(reply: Any) -> str:
+    if isinstance(reply, str):
+        normalized = reply.strip()
+        return normalized or "我没有生成有效回复。"
+    if reply is None:
+        return "我没有生成有效回复。"
+    normalized = str(reply).strip()
+    return normalized or "我没有生成有效回复。"
+
+
+def _storyboard_breakdown_prompt(*, query: str, references: list[dict]) -> str:
+    return (
+        "你是资深分镜策划与导演助理。"
+        "请把用户提供的文档、脚本、策划案、采访稿或说明文字，拆解成可执行的分镜需求，并输出中文 Markdown。\n"
+        "要求：\n"
+        "1. 先给需求摘要与推荐成片方向。\n"
+        "2. 给出建议总时长、节奏分段和结构章节。\n"
+        "3. 输出一份分镜清单。每条至少包含：镜号、画面内容、景别、机位/运镜、建议时长、台词/旁白/字幕、音效/音乐、备注。\n"
+        "4. 如果适合，补一列生成提示词方向（不是最终成稿，也可以是简短提示）。\n"
+        "5. 如果原始材料有逻辑断层、素材不足或关键信息缺失，要明确写出待补充项。\n"
+        "6. 不要假装已经创建飞书项目，也不要输出空泛建议；尽量把内容拆到镜头级。\n"
+        "7. 如果用户其实是在问“该怎么拆”，也可以输出一份拆解方案，但依然尽量给出示例镜头。\n\n"
+        f"用户请求：{query}\n\n"
         f"已提供文件内容（JSON 或文本）：\n{_reference_context_block(references)}"
     )
 
@@ -1306,29 +2500,122 @@ def _format_openai_research_response(data: dict) -> str:
     return (text or "我没有生成有效研究结果。").strip() + "\n" + "\n".join(source_lines)
 
 
-def _format_google_interaction_response(data: dict) -> str:
+def _format_google_interaction_response(data: dict) -> DeepResearchResult:
     text = _extract_google_interaction_text(data)
     if text:
-        return text
+        return DeepResearchResult(markdown=text, raw_text=text, raw_payload=data)
     raise RuntimeError("Gemini Deep Research completed without a readable text report")
 
 
 def _extract_google_interaction_text(data: dict) -> str:
+    candidates: list[str] = []
     outputs = data.get("outputs") or []
-    if outputs:
-        last_output = outputs[-1] or {}
-        text = str(last_output.get("text") or "").strip()
+    ordered_output_texts: list[str] = []
+    for output in outputs:
+        if not isinstance(output, dict):
+            continue
+        text = str(output.get("text") or "").strip()
         if text:
-            return text
-    for step in reversed(data.get("steps") or []):
+            candidates.append(text)
+            if not _looks_like_source_only_block(text):
+                ordered_output_texts.append(text)
+    if len(ordered_output_texts) >= 2:
+        merged = _merge_ordered_google_output_texts(ordered_output_texts)
+        if merged:
+            return merged
+    if len(ordered_output_texts) == 1:
+        return ordered_output_texts[0]
+    for step in data.get("steps") or []:
+        if not isinstance(step, dict):
+            continue
         for content in step.get("content") or []:
             if not isinstance(content, dict):
                 continue
             if content.get("type") == "text" and content.get("text"):
                 text = str(content.get("text") or "").strip()
                 if text:
-                    return text
-    return ""
+                    candidates.append(text)
+    for value in _collect_text_fields(data):
+        if value:
+            candidates.append(value)
+    unique_candidates = list(dict.fromkeys(item.strip() for item in candidates if item and item.strip()))
+    if not unique_candidates:
+        return ""
+    return max(unique_candidates, key=_google_text_candidate_score)
+
+
+def _merge_ordered_google_output_texts(texts: list[str]) -> str:
+    merged: list[str] = []
+    for text in texts:
+        current = text.strip()
+        if not current:
+            continue
+        if merged and current in merged[-1]:
+            continue
+        if merged and merged[-1] in current:
+            merged[-1] = current
+            continue
+        merged.append(current)
+    return "\n\n".join(merged).strip()
+
+
+def _collect_text_fields(value: Any) -> list[str]:
+    results: list[str] = []
+    if isinstance(value, dict):
+        text_value = value.get("text")
+        if isinstance(text_value, str) and text_value.strip():
+            results.append(text_value.strip())
+        for nested_key, nested_value in value.items():
+            if nested_key == "text":
+                continue
+            results.extend(_collect_text_fields(nested_value))
+    elif isinstance(value, list):
+        for item in value:
+            results.extend(_collect_text_fields(item))
+    return results
+
+
+def _google_text_candidate_score(text: str) -> int:
+    stripped = text.strip()
+    if not stripped:
+        return -10_000
+    lines = [line.strip() for line in stripped.splitlines() if line.strip()]
+    url_count = len(re.findall(r"https?://", stripped))
+    markdown_link_count = len(re.findall(r"\[[^\]]+\]\(https?://", stripped))
+    source_like_lines = sum(1 for line in lines if _line_is_mostly_link(line))
+    heading_hits = len(re.findall(r"(^|\n)#{1,6}\s", stripped)) + len(
+        re.findall(r"(结论|摘要|时间线|背景|产品|车型|融资|风险|来源)", stripped)
+    )
+    sentence_punctuation = len(re.findall(r"[。！？；：]", stripped))
+    score = len(stripped) + heading_hits * 300 + sentence_punctuation * 20
+    score -= (url_count + markdown_link_count) * 35
+    score -= source_like_lines * 120
+    if _looks_like_source_only_block(stripped):
+        score -= 10_000
+    return score
+
+
+def _line_is_mostly_link(line: str) -> bool:
+    compact = re.sub(r"\s+", " ", line.strip())
+    if not compact:
+        return False
+    if "http://" in compact or "https://" in compact:
+        text_without_links = re.sub(r"https?://\S+", "", compact).strip(" -:：|[]()")
+        return len(text_without_links) <= 20
+    return False
+
+
+def _looks_like_source_only_block(text: str) -> bool:
+    lower = text.strip().lower()
+    if lower.startswith("sources") or lower.startswith("references") or lower.startswith("citations"):
+        return True
+    if lower.startswith("**sources") or lower.startswith("**references") or lower.startswith("**来源"):
+        return True
+    lines = [line.strip() for line in text.splitlines() if line.strip()]
+    if not lines:
+        return False
+    source_like_lines = sum(1 for line in lines if _line_is_mostly_link(line))
+    return source_like_lines >= max(2, len(lines) - 1)
 
 
 def _google_interaction_error(data: dict) -> str:
@@ -1341,13 +2628,13 @@ def _google_interaction_error(data: dict) -> str:
 def _chat_content_from_response(data: dict) -> str:
     message = (data.get("choices") or [{}])[0].get("message") or {}
     content = message.get("content")
-    if isinstance(content, str):
-        return content.strip() or "我没有生成有效研究结果。"
+    if isinstance(content, str) or content is None:
+        return _normalize_assistant_reply(content).replace("有效回复", "有效研究结果")
     if isinstance(content, list):
         parts: list[str] = []
         for item in content:
             if isinstance(item, dict):
-                text = str(item.get("text") or item.get("content") or "").strip()
+                text = _normalize_assistant_reply(item.get("text") or item.get("content"))
                 if text:
                     parts.append(text)
         if parts:
@@ -1467,8 +2754,12 @@ def _reference_context_block(references: list[dict]) -> str:
     blocks = []
     for index, item in enumerate(references, start=1):
         if item.get("type") == "feishu_doc":
-            payload = json.dumps(item.get("content_json") or {}, ensure_ascii=False)
-            blocks.append(f"{index}. Feishu Doc {item.get('url')}\n{payload}")
+            text_content = str(item.get("text_content") or "").strip()
+            if text_content:
+                blocks.append(f"{index}. Feishu Doc {item.get('url')}\n{text_content}")
+            else:
+                payload = json.dumps(item.get("content_json") or {}, ensure_ascii=False)
+                blocks.append(f"{index}. Feishu Doc {item.get('url')}\n{payload}")
             continue
         blocks.append(
             f"{index}. Feishu File {item.get('filename') or item.get('file_token')}\n"
@@ -1491,7 +2782,7 @@ async def _dashscope_chat(*, model: str, messages: list[dict[str, str]]) -> str:
         )
     response.raise_for_status()
     data = response.json()
-    return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip() or "我没有生成有效回复。"
+    return _normalize_assistant_reply(data.get("choices", [{}])[0].get("message", {}).get("content"))
 
 
 async def _openai_chat(*, model: str, messages: list[dict[str, str]]) -> str:
@@ -1530,7 +2821,7 @@ async def _deepseek_chat(*, model: str, messages: list[dict[str, str]]) -> str:
         )
     response.raise_for_status()
     data = response.json()
-    return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip() or "我没有生成有效回复。"
+    return _normalize_assistant_reply(data.get("choices", [{}])[0].get("message", {}).get("content"))
 
 
 async def _openrouter_chat(*, model: str, messages: list[dict[str, str]], enable_web_search: bool = False) -> str:
@@ -1556,4 +2847,4 @@ async def _openrouter_chat(*, model: str, messages: list[dict[str, str]], enable
         )
     response.raise_for_status()
     data = response.json()
-    return data.get("choices", [{}])[0].get("message", {}).get("content", "").strip() or "我没有生成有效回复。"
+    return _chat_content_from_response(data)

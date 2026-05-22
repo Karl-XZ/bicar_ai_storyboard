@@ -71,9 +71,10 @@ def on_message_receive(data) -> None:
     text = _message_text(message_payload)
     chat_id = message.chat_id or settings.feishu_default_chat_id
     chat_type = message.chat_type
+    message_id = message.message_id
     sender_open_id = sender_id.open_id if sender_id else None
-    logger.info("received message event chat_id=%s chat_type=%s sender_open_id=%s text=%s", chat_id, chat_type, sender_open_id, text)
-    message_executor.submit(_run_bot_text, text, chat_id, chat_type, sender_open_id)
+    logger.info("received message event chat_id=%s chat_type=%s message_id=%s sender_open_id=%s text=%s", chat_id, chat_type, message_id, sender_open_id, text)
+    message_executor.submit(_run_bot_text, text, chat_id, chat_type, sender_open_id, message_id)
 
 
 def on_card_action(data) -> P2CardActionTriggerResponse:
@@ -106,10 +107,10 @@ def on_bitable_record_changed(data) -> None:
     _dispatch_bitable_record_changed(app_token, table_id, actions)
 
 
-def _run_bot_text(text: str, chat_id: str | None, chat_type: str | None, sender_open_id: str | None) -> None:
+def _run_bot_text(text: str, chat_id: str | None, chat_type: str | None, sender_open_id: str | None, source_message_id: str | None) -> None:
     db = SessionLocal()
     try:
-        result = asyncio.run(handle_bot_text(db, text=text, chat_id=chat_id, chat_type=chat_type, sender_open_id=sender_open_id))
+        result = asyncio.run(handle_bot_text(db, text=text, chat_id=chat_id, chat_type=chat_type, sender_open_id=sender_open_id, source_message_id=source_message_id))
         logger.info("message handled result=%s", result)
     except Exception:
         logger.exception("message handling failed")

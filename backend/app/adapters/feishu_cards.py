@@ -4,6 +4,12 @@ import json
 import re
 
 
+LOCAL_ARTIFACT_PATTERN = re.compile(
+    r"(file://\S+|/Users/[^\s)\]>]+|/[^\s)\]>]+\.(?:png|jpg|jpeg|webp|gif|bmp|mp4|mov|m4v|webm|pdf|docx|txt|md)|\b[A-Za-z0-9._-]+\.(?:png|jpg|jpeg|webp|gif|bmp|mp4|mov|m4v|webm|pdf|docx|txt|md)\b)",
+    flags=re.IGNORECASE,
+)
+
+
 def project_overview_card(*, project_name: str, table_url: str | None, stats: dict) -> dict:
     return {
         "config": {"wide_screen_mode": True},
@@ -45,41 +51,83 @@ def project_overview_card(*, project_name: str, table_url: str | None, stats: di
     }
 
 
-def chatbot_reply_card(*, content: str, title: str = "哔车AI助手", chat_type: str | None = None, sender_open_id: str | None = None) -> dict:
+def chatbot_reply_card(
+    *,
+    content: str,
+    title: str = "哔车AI助手",
+    chat_id: str | None = None,
+    chat_type: str | None = None,
+    sender_open_id: str | None = None,
+    include_actions: bool = True,
+) -> dict:
     markdown = render_feishu_markdown(content)
     quick_action_value = {
+        "chat_id": chat_id,
         "chat_type": chat_type,
         "sender_open_id": sender_open_id,
     }
+    actions = [
+        {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "/Agent"},
+            "type": "primary",
+            "value": {**quick_action_value, "action": "assistant.set_mode", "mode": "agent"},
+        },
+        {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "/普通助手"},
+            "type": "default",
+            "value": {**quick_action_value, "action": "assistant.set_mode", "mode": "chat"},
+        },
+        {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "/New Session"},
+            "type": "default",
+            "value": {**quick_action_value, "action": "assistant.clear_session"},
+        },
+        {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "/视频助手"},
+            "type": "default",
+            "value": {**quick_action_value, "action": "assistant.set_mode", "mode": "storyboard"},
+        },
+        {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "/Deep Research"},
+            "type": "primary",
+            "value": {**quick_action_value, "action": "assistant.set_mode", "mode": "deep_research"},
+        },
+        {
+            "tag": "button",
+            "text": {"tag": "plain_text", "content": "/分镜拆解"},
+            "type": "default",
+            "value": {**quick_action_value, "action": "assistant.set_mode", "mode": "storyboard_breakdown"},
+        },
+    ]
+    if _contains_local_artifact_hint(content):
+        actions.insert(
+            0,
+            {
+                "tag": "button",
+                "text": {"tag": "plain_text", "content": "保存到飞书"},
+                "type": "primary",
+                "value": {**quick_action_value, "action": "assistant.upload_recent_artifact"},
+            },
+        )
+    elements = [
+        {"tag": "markdown", "content": markdown},
+    ]
+    if include_actions:
+        elements.append(
+            {
+                "tag": "action",
+                "actions": actions,
+            }
+        )
     return {
         "config": {"wide_screen_mode": True},
         "header": {"title": {"tag": "plain_text", "content": title}, "template": "wathet"},
-        "elements": [
-            {"tag": "markdown", "content": markdown},
-            {
-                "tag": "action",
-                "actions": [
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "/New Session"},
-                        "type": "default",
-                        "value": {**quick_action_value, "action": "assistant.clear_session"},
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "/视频助手"},
-                        "type": "default",
-                        "value": {**quick_action_value, "action": "assistant.set_mode", "mode": "storyboard"},
-                    },
-                    {
-                        "tag": "button",
-                        "text": {"tag": "plain_text", "content": "/Deep Research"},
-                        "type": "primary",
-                        "value": {**quick_action_value, "action": "assistant.set_mode", "mode": "deep_research"},
-                    },
-                ],
-            },
-        ],
+        "elements": elements,
     }
 
 
@@ -87,6 +135,11 @@ def render_feishu_markdown(content: str) -> str:
     text = (content or "").strip() or "我暂时没有生成有效回复。"
     text = _downgrade_unsupported_headings(text)
     return _convert_markdown_tables(text)
+
+
+def _contains_local_artifact_hint(content: str) -> bool:
+    text = str(content or "")
+    return bool(LOCAL_ARTIFACT_PATTERN.search(text))
 
 
 def _downgrade_unsupported_headings(text: str) -> str:
@@ -204,9 +257,13 @@ def help_card() -> dict:
             "**常用命令**",
             "",
             "- 直接聊天：不加 `/` 时，机器人会按普通助手回复",
+            "- `/Agent` / `/智能体` / `/Codex`：把当前会话切到 Agent 模式；默认走 Codex，群聊和私聊各自隔离",
+            "- `/Agent deepseek`：把当前会话切到 DeepSeek Agent 模式",
+            "- `/切换Agent模型 codex|deepseek`：切换当前会话的 Agent 运行后端",
             "- `/普通助手`：把当前会话切回普通对话助手",
             "- `/分镜助手` / `/视频助手`：把当前会话切到分镜工作流助手",
             "- `/Deep Research`：把当前会话切到深度研究模式，后续会联网检索并把研究结果保存为飞书文档",
+            "- `/拆分镜需求` / `/分镜拆解`：读取你提供的飞书云文档、飞书文件或脚本文字，拆成镜头级分镜需求，并保存为飞书文档",
             "- `/help` / `/帮助` / `/菜单`：查看这张说明卡片",
             "- `/New session`：重置当前群聊或私聊会话的聊天记录，不影响项目和模型设置",
             "- `/新建分镜项目：项目名`：创建分镜表和项目文件夹",
@@ -227,6 +284,7 @@ def help_card() -> dict:
             "- `/同步表格`：补齐默认值并同步分镜行",
             "- `/查看进度`：查看最近项目进度",
             "- Deep Research 模式下如果消息里附带飞书文档/文件链接，系统会读取文档内容或文本文件内容，再结合联网结果写研究报告",
+            "- 分镜拆解模式下如果消息里附带飞书文档/文件链接，系统会读取内容并拆成分镜需求；也可以直接发支持的 docx 文件消息",
             "",
             "**直接生成示例**",
             "",

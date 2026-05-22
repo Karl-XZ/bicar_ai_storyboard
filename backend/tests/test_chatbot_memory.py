@@ -1,4 +1,5 @@
 import asyncio
+from pathlib import Path
 
 import httpx
 from sqlalchemy import create_engine
@@ -62,11 +63,6 @@ def test_latest_for_chat_does_not_fall_back_to_other_chat():
 
 def test_chatbot_reply_uses_history_and_persists_turn(monkeypatch):
     db = make_db()
-    project = ProjectService(db).create_project(CreateProjectRequest(name="群聊项目"))
-    project.feishu_app_token = "app_001"
-    project.workflow_config = {**(project.workflow_config or {}), "chat_id": "oc_group"}
-    db.commit()
-
     history = ChatMemoryService(db, chat_id="oc_group", chat_type="group", sender_open_id="ou_alice")
     history.append_turn(user_text="第一问", assistant_text="第一答")
     db.commit()
@@ -99,12 +95,12 @@ def test_chatbot_reply_uses_history_and_persists_turn(monkeypatch):
     messages = captured["messages"]
     assert isinstance(messages, list)
     assert "哔车AI助手" in messages[0]["content"]
-    assert "当前绑定项目：群聊项目" in messages[0]["content"]
     assert "最近一次模型 smoke test 时间：2026-05-09" in messages[0]["content"]
     assert "小云雀 已正式接入当前项目" in messages[0]["content"]
     assert "/Deep Research" in messages[0]["content"]
     assert "/分镜助手" in messages[0]["content"]
     assert "deepseek-v4-pro、deepseek-v4-flash" in messages[0]["content"]
+    assert "当前绑定项目" not in messages[0]["content"]
     assert messages[1:] == [
         {"role": "user", "content": "第一问"},
         {"role": "assistant", "content": "第一答"},
@@ -151,7 +147,147 @@ def test_handle_bot_text_sends_normal_chat_as_markdown_card(monkeypatch):
     assert sent["card"]["header"]["title"]["content"] == "哔车AI助手"
     assert sent["card"]["elements"][0]["tag"] == "markdown"
     assert "**回复重点**" in sent["card"]["elements"][0]["content"]
-    assert sent["card"]["elements"][1]["actions"][0]["text"]["content"] == "/New Session"
+    assert sent["card"]["elements"][1]["actions"][0]["text"]["content"] == "/Agent"
+
+
+def test_handle_bot_text_streams_long_reply_in_multiple_cards(monkeypatch):
+    db = make_db()
+    cards: list[dict] = []
+
+    class FakeFeishuClient:
+        async def send_card(self, receive_id: str, card: dict, receive_id_type: str = "chat_id") -> dict:
+            cards.append(card)
+            return {"ok": True}
+
+        async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> dict:
+            raise AssertionError("segmented send should not fall back to text when all chunks succeed")
+
+    async def fake_chatbot_reply(*args, **kwargs) -> str:
+        return ("\n\n".join([f"第{i}段：" + ("内容" * 260) for i in range(1, 4)])).strip()
+
+    monkeypatch.setattr(bot_commands, "FeishuClient", FakeFeishuClient)
+    monkeypatch.setattr(bot_commands, "_chatbot_reply", fake_chatbot_reply)
+
+    asyncio.run(
+        bot_commands.handle_bot_text(
+            db,
+            text="给我一段很长的回复",
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+        )
+    )
+
+    assert len(cards) >= 2
+    assert cards[0]["header"]["title"]["content"].startswith("哔车AI助手（1/")
+    assert cards[-1]["elements"][-1]["tag"] == "action"
+
+
+def test_send_reply_segmented_falls_back_to_full_reply(monkeypatch):
+    sent_cards: list[dict] = []
+    sent_texts: list[str] = []
+
+    class FakeFeishuClient:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        async def send_card(self, receive_id: str, card: dict, receive_id_type: str = "chat_id") -> dict:
+            self.calls += 1
+            if self.calls == 2:
+                raise RuntimeError("chunk send failed")
+            sent_cards.append(card)
+            return {"ok": True}
+
+        async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> dict:
+            sent_texts.append(text)
+            return {"ok": True}
+
+    count = asyncio.run(
+        bot_commands._send_reply_segmented(
+            feishu=FakeFeishuClient(),
+            target_chat="oc_group",
+            content=("\n\n".join([f"第{i}段：" + ("内容" * 260) for i in range(1, 4)])).strip(),
+            title="哔车AI助手",
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+            request_context=None,
+        )
+    )
+
+    assert count >= 2
+    assert any("分段发送中断" in text for text in sent_texts)
+    assert sent_cards[-1]["header"]["title"]["content"] == "哔车AI助手"
+
+
+def test_reply_with_timeout_hint_notifies_after_five_minutes(monkeypatch):
+    sent: list[str] = []
+
+    class FakeFeishuClient:
+        async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> dict:
+            sent.append(text)
+            return {"ok": True}
+
+    async def fake_chatbot_reply(*args, **kwargs) -> str:
+        await asyncio.sleep(0)
+        return "最终回复"
+
+    async def fake_wait(tasks, timeout=None):
+        return set(), set(tasks)
+
+    monkeypatch.setattr(bot_commands, "_chatbot_reply", fake_chatbot_reply)
+    monkeypatch.setattr(bot_commands.asyncio, "wait", fake_wait)
+
+    reply = asyncio.run(
+        bot_commands._reply_with_timeout_hint(
+            make_db(),
+            text="你好",
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+            progress_notifier=None,
+            hint_enabled=True,
+            feishu=FakeFeishuClient(),
+            request_context=None,
+        )
+    )
+
+    assert reply == "最终回复"
+    assert any("超过 5 分钟仍未回复" in message for message in sent)
+
+
+def test_handle_bot_text_sends_failure_reason_when_normal_chat_errors(monkeypatch):
+    db = make_db()
+    sent: list[str] = []
+
+    class FakeFeishuClient:
+        async def send_card(self, receive_id: str, card: dict, receive_id_type: str = "chat_id") -> dict:
+            raise AssertionError("failing normal chat should not send card")
+
+        async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> dict:
+            sent.append(text)
+            return {"ok": True}
+
+    async def fail_reply_with_timeout_hint(*args, **kwargs):
+        raise RuntimeError("provider timeout")
+
+    monkeypatch.setattr(bot_commands, "FeishuClient", FakeFeishuClient)
+    monkeypatch.setattr(bot_commands, "_reply_with_timeout_hint", fail_reply_with_timeout_hint)
+
+    result = asyncio.run(
+        bot_commands.handle_bot_text(
+            db,
+            text="普通聊天测试",
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+        )
+    )
+
+    assert result["message"] == "chatbot 回复失败"
+    assert "provider timeout" in result["data"]["error"]
+    assert any("本次请求处理失败，请重试" in message for message in sent)
+    assert any("provider timeout" in message for message in sent)
 
 
 def test_switch_chatbot_model_persists_without_project(monkeypatch):
@@ -183,14 +319,154 @@ def test_switch_chatbot_model_persists_without_project(monkeypatch):
     assert result == {"message": "chatbot 模型已切换", "data": {"model": "google/gemini-3.1-pro-preview"}}
     assert sent["receive_id"] == "oc_group"
     assert sent["text"] == "chatbot 文本模型已切换为：google/gemini-3.1-pro-preview"
-    assert (
-        ChatPreferenceService(db).get_chatbot_text_model(
+
+
+def test_switch_agent_runtime_persists_without_project(monkeypatch):
+    db = make_db()
+    sent: dict[str, object] = {}
+
+    class FakeFeishuClient:
+        async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> dict:
+            sent["receive_id"] = receive_id
+            sent["text"] = text
+            return {"ok": True}
+
+        async def send_card(self, receive_id: str, card: dict, receive_id_type: str = "chat_id") -> dict:
+            raise AssertionError("runtime switch should respond with text")
+
+    monkeypatch.setattr(bot_commands, "FeishuClient", FakeFeishuClient)
+
+    result = asyncio.run(
+        bot_commands.handle_bot_text(
+            db,
+            text="/切换Agent模型 deepseek",
             chat_id="oc_group",
             chat_type="group",
             sender_open_id="ou_alice",
         )
-        == "google/gemini-3.1-pro-preview"
     )
+
+    assert result == {"message": "agent runtime 已切换", "data": {"runtime": "deepseek"}}
+    assert sent["text"] == "Agent 运行后端已切换为：DeepSeek。当前会话下次进入 `/Agent` 或继续 Agent 对话时生效。"
+    assert (
+        ChatPreferenceService(db).get_agent_runtime(
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+        )
+        == "deepseek"
+    )
+
+
+def test_agent_reply_uses_deepseek_runtime_when_selected(monkeypatch):
+    db = make_db()
+    prefs = ChatPreferenceService(db)
+    prefs.set_assistant_mode(chat_id="oc_group", chat_type="group", sender_open_id="ou_alice", mode="agent")
+    prefs.set_agent_runtime(chat_id="oc_group", chat_type="group", sender_open_id="ou_alice", runtime="deepseek")
+    db.commit()
+
+    captured: dict[str, object] = {}
+    reactions: list[tuple[str, str]] = []
+
+    class FakeFeishuClient:
+        async def add_message_reaction(self, message_id: str, emoji_type: str) -> dict:
+            reactions.append(("add", message_id))
+            return {"data": {"reaction_id": "r_001"}}
+
+        async def remove_message_reaction(self, message_id: str, reaction_id: str) -> dict:
+            reactions.append(("remove", message_id))
+            return {"data": {}}
+
+    async def fake_run_openclaw_agent(*, session_id: str, message: str, timeout_seconds: int = 600, session_key: str | None = None, model: str | None = None) -> dict[str, object]:
+        captured["session_id"] = session_id
+        captured["message"] = message
+        captured["session_key"] = session_key
+        captured["model"] = model
+        return {"result": {"finalAssistantVisibleText": "deepseek agent reply"}}
+
+    monkeypatch.setattr(bot_commands, "FeishuClient", FakeFeishuClient)
+    monkeypatch.setattr(bot_commands, "_run_openclaw_agent", fake_run_openclaw_agent)
+
+    reply = asyncio.run(
+        bot_commands._chatbot_reply(
+            db,
+            text="请总结",
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+            source_message_id="om_msg_001",
+        )
+    )
+
+    assert reply == "deepseek agent reply"
+    assert captured["message"] == "请总结"
+    assert captured["model"] == "deepseek/deepseek-v4-pro"
+    assert reactions == [("add", "om_msg_001"), ("remove", "om_msg_001")]
+
+
+def test_agent_mode_command_runtime_switch_bumps_agent_nonce(monkeypatch):
+    db = make_db()
+    prefs = ChatPreferenceService(db)
+    prefs.set_assistant_mode(chat_id="oc_group", chat_type="group", sender_open_id="ou_alice", mode="chat")
+    before_nonce = prefs.get_agent_session_nonce(chat_id="oc_group", chat_type="group", sender_open_id="ou_alice")
+
+    sent: dict[str, str] = {}
+
+    class FakeFeishuClient:
+        async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> dict:
+            sent["text"] = text
+            return {"ok": True}
+
+        async def send_card(self, receive_id: str, card: dict, receive_id_type: str = "chat_id") -> dict:
+            raise AssertionError("mode switch should respond with text")
+
+    monkeypatch.setattr(bot_commands, "FeishuClient", FakeFeishuClient)
+
+    result = asyncio.run(
+        bot_commands.handle_bot_text(
+            db,
+            text="/Agent deepseek",
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+        )
+    )
+
+    after_nonce = prefs.get_agent_session_nonce(chat_id="oc_group", chat_type="group", sender_open_id="ou_alice")
+    assert result == {"message": "聊天模式已切换", "data": {"mode": "agent"}}
+    assert after_nonce == before_nonce + 1
+    assert "Agent（DeepSeek）" in sent["text"]
+
+
+def test_handle_card_action_dedupes_same_mode_switch(monkeypatch):
+    db = make_db()
+    sent: list[str] = []
+
+    class FakeFeishuClient:
+        async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> dict:
+            sent.append(text)
+            return {"ok": True}
+
+    monkeypatch.setattr(bot_commands, "FeishuClient", FakeFeishuClient)
+
+    first = asyncio.run(
+        bot_commands.handle_card_action(
+            db,
+            value={"action": "assistant.set_mode", "mode": "chat", "chat_id": "oc_group", "chat_type": "group", "sender_open_id": "ou_alice"},
+            chat_id="oc_group",
+        )
+    )
+    second = asyncio.run(
+        bot_commands.handle_card_action(
+            db,
+            value={"action": "assistant.set_mode", "mode": "chat", "chat_id": "oc_group", "chat_type": "group", "sender_open_id": "ou_alice"},
+            chat_id="oc_group",
+        )
+    )
+
+    assert first["message"] == "聊天模式已切换"
+    assert second["message"] == "重复模式切换已忽略"
+    assert len(sent) == 1
 
 
 def test_new_session_command_clears_only_current_session(monkeypatch):
@@ -233,6 +509,80 @@ def test_new_session_command_clears_only_current_session(monkeypatch):
         "私聊第一问",
         "私聊第一答",
     ]
+
+
+def test_chat_memory_is_isolated_between_groups_and_private_sessions():
+    db = make_db()
+    group_a = ChatMemoryService(db, chat_id="oc_group_a", chat_type="group", sender_open_id="ou_alice")
+    group_b = ChatMemoryService(db, chat_id="oc_group_b", chat_type="group", sender_open_id="ou_alice")
+    private_alice = ChatMemoryService(db, chat_id="oc_p2p_a", chat_type="p2p", sender_open_id="ou_alice")
+    private_bob = ChatMemoryService(db, chat_id="oc_p2p_b", chat_type="p2p", sender_open_id="ou_bob")
+
+    group_a.append_turn(user_text="乐高项目", assistant_text="群A回复")
+    group_b.append_turn(user_text="e.go项目", assistant_text="群B回复")
+    private_alice.append_turn(user_text="Alice私聊", assistant_text="Alice回复")
+    private_bob.append_turn(user_text="Bob私聊", assistant_text="Bob回复")
+    db.commit()
+
+    assert [item.content for item in group_a.recent_messages()] == ["乐高项目", "群A回复"]
+    assert [item.content for item in group_b.recent_messages()] == ["e.go项目", "群B回复"]
+    assert [item.content for item in private_alice.recent_messages()] == ["Alice私聊", "Alice回复"]
+    assert [item.content for item in private_bob.recent_messages()] == ["Bob私聊", "Bob回复"]
+
+
+def test_newer_chat_request_suppresses_older_reply(monkeypatch):
+    db = make_db()
+    sent_cards: list[str] = []
+    release_first = asyncio.Event()
+    call_count = {"value": 0}
+
+    class FakeFeishuClient:
+        async def send_card(self, receive_id: str, card: dict, receive_id_type: str = "chat_id") -> dict:
+            sent_cards.append(card["elements"][0]["content"])
+            return {"ok": True}
+
+        async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> dict:
+            return {"ok": True}
+
+    async def fake_generate_chat_response(*, model: str, messages: list[dict[str, str]], text: str, assistant_mode: str) -> str:
+        call_count["value"] += 1
+        if call_count["value"] == 1:
+            await release_first.wait()
+            return "旧回复"
+        return "新回复"
+
+    monkeypatch.setattr(bot_commands, "FeishuClient", FakeFeishuClient)
+    monkeypatch.setattr(bot_commands, "_generate_chat_response", fake_generate_chat_response)
+
+    async def run_scenario():
+        first = asyncio.create_task(
+            bot_commands.handle_bot_text(
+                db,
+                text="第一条消息",
+                chat_id="oc_group",
+                chat_type="group",
+                sender_open_id="ou_alice",
+            )
+        )
+        await asyncio.sleep(0)
+        second = asyncio.create_task(
+            bot_commands.handle_bot_text(
+                db,
+                text="第二条消息",
+                chat_id="oc_group",
+                chat_type="group",
+                sender_open_id="ou_alice",
+            )
+        )
+        await asyncio.sleep(0)
+        release_first.set()
+        return await asyncio.gather(first, second)
+
+    results = asyncio.run(run_scenario())
+
+    assert results[0]["message"] == "chatbot 旧回复已抑制"
+    assert results[1]["message"] == "chatbot 已回复"
+    assert sent_cards == ["新回复"]
 
 
 def test_chatbot_reply_enables_openrouter_web_search_for_gemini_models(monkeypatch):
@@ -301,7 +651,7 @@ def test_assistant_mode_switch_persists(monkeypatch):
     )
 
     assert result == {"message": "聊天模式已切换", "data": {"mode": "storyboard"}}
-    assert sent["text"] == "当前会话已切换为：分镜助手"
+    assert sent["text"] == "当前会话已切换为：分镜助手。请继续发送分镜需求、项目命令或素材说明。"
     assert (
         ChatPreferenceService(db).get_assistant_mode(
             chat_id="oc_group",
@@ -309,6 +659,40 @@ def test_assistant_mode_switch_persists(monkeypatch):
             sender_open_id="ou_alice",
         )
         == "storyboard"
+    )
+
+
+def test_agent_mode_switch_persists(monkeypatch):
+    db = make_db()
+    sent: dict[str, object] = {}
+
+    class FakeFeishuClient:
+        async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> dict:
+            sent["receive_id"] = receive_id
+            sent["text"] = text
+            return {"ok": True}
+
+    monkeypatch.setattr(bot_commands, "FeishuClient", FakeFeishuClient)
+
+    result = asyncio.run(
+        bot_commands.handle_bot_text(
+            db,
+            text="/Agent",
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+        )
+    )
+
+    assert result == {"message": "聊天模式已切换", "data": {"mode": "agent"}}
+    assert "当前会话已切换为：Agent" in sent["text"]
+    assert (
+        ChatPreferenceService(db).get_assistant_mode(
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+        )
+        == "agent"
     )
 
 
@@ -354,9 +738,6 @@ def test_openrouter_chat_includes_web_search_tool_when_enabled(monkeypatch):
 
 def test_chatbot_reply_uses_deep_research_mode(monkeypatch):
     db = make_db()
-    project = ProjectService(db).create_project(CreateProjectRequest(name="不应注入的项目"))
-    project.feishu_app_token = "app_001"
-    project.workflow_config = {**(project.workflow_config or {}), "chat_id": "oc_group"}
     ChatPreferenceService(db).set_assistant_mode(
         chat_id="oc_group",
         chat_type="group",
@@ -367,7 +748,7 @@ def test_chatbot_reply_uses_deep_research_mode(monkeypatch):
 
     captured: dict[str, object] = {}
 
-    async def fake_deep_research_reply(*, project, query: str, messages: list[dict[str, str]], active_model: str) -> str:
+    async def fake_deep_research_reply(*, query: str, messages: list[dict[str, str]], active_model: str, progress_notifier=None, request_context=None) -> str:
         captured["query"] = query
         captured["messages"] = messages
         captured["active_model"] = active_model
@@ -389,6 +770,411 @@ def test_chatbot_reply_uses_deep_research_mode(monkeypatch):
     assert captured["query"] == "请研究 e.go 的发展历程"
     assert captured["active_model"] == "deepseek-v4-pro"
     assert "Deep Research" in captured["messages"][0]["content"]
+    assert "当前绑定项目" not in captured["messages"][0]["content"]
+    assert "不应注入的项目" not in captured["messages"][0]["content"]
+    assert (
+        ChatPreferenceService(db).get_assistant_mode(
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+        )
+        == "chat"
+    )
+
+
+def test_chatbot_reply_uses_agent_mode_and_appends_local_memory(monkeypatch):
+    db = make_db()
+    preferences = ChatPreferenceService(db)
+    preferences.set_assistant_mode(
+        chat_id="oc_group",
+        chat_type="group",
+        sender_open_id="ou_alice",
+        mode="agent",
+    )
+    ChatMemoryService(db, chat_id="oc_group", chat_type="group", sender_open_id="ou_alice").append_turn(
+        user_text="旧问题",
+        assistant_text="旧回答",
+    )
+    db.commit()
+
+    captured: dict[str, object] = {}
+    reactions: list[tuple[str, str]] = []
+
+    class FakeFeishuClient:
+        async def add_message_reaction(self, message_id: str, emoji_type: str) -> dict:
+            reactions.append(("add", message_id))
+            return {"data": {"reaction_id": "r_001"}}
+
+        async def remove_message_reaction(self, message_id: str, reaction_id: str) -> dict:
+            reactions.append(("remove", message_id))
+            return {"data": {}}
+
+    async def fake_run_openclaw_agent(*, session_id: str, message: str, timeout_seconds: int = 600, session_key: str | None = None, model: str | None = None) -> dict[str, object]:
+        captured["session_id"] = session_id
+        captured["message"] = message
+        captured["session_key"] = session_key
+        captured["model"] = model
+        return {"result": {"finalAssistantVisibleText": "agent reply"}}
+
+    monkeypatch.setattr(bot_commands, "_openclaw_agent_session_file", lambda _: Path("/tmp/nonexistent-openclaw-session.jsonl"))
+    monkeypatch.setattr(bot_commands, "FeishuClient", FakeFeishuClient)
+    monkeypatch.setattr(bot_commands, "_run_openclaw_agent", fake_run_openclaw_agent)
+
+    reply = asyncio.run(
+        bot_commands._chatbot_reply(
+            db,
+            text="请帮我查日志",
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+            source_message_id="om_msg_001",
+        )
+    )
+
+    assert reply == "agent reply"
+    assert "当前新请求：请帮我查日志" in captured["message"]
+    assert "用户：旧问题" in captured["message"]
+    assert "助手：旧回答" in captured["message"]
+    assert captured["model"] is None
+    assert reactions == [("add", "om_msg_001"), ("remove", "om_msg_001")]
+    messages = ChatMemoryService(db, chat_id="oc_group", chat_type="group", sender_open_id="ou_alice").recent_messages()
+    assert [item.content for item in messages] == ["旧问题", "旧回答", "请帮我查日志", "agent reply"]
+
+
+def test_deepseek_agent_second_turn_sees_previous_material(monkeypatch):
+    db = make_db()
+    prefs = ChatPreferenceService(db)
+    prefs.set_assistant_mode(chat_id="oc_group", chat_type="group", sender_open_id="ou_alice", mode="agent")
+    prefs.set_agent_runtime(chat_id="oc_group", chat_type="group", sender_open_id="ou_alice", runtime="deepseek")
+    db.commit()
+
+    captured_calls: list[str] = []
+
+    async def fake_run_openclaw_agent(*, session_id: str, message: str, timeout_seconds: int = 600, session_key: str | None = None, model: str | None = None) -> dict[str, object]:
+        captured_calls.append(message)
+        if len(captured_calls) == 1:
+            return {"result": {"finalAssistantVisibleText": "我读到了资料结构。"}}
+        return {"result": {"finalAssistantVisibleText": "我读到了标题、原文链接和资料链接。"}}
+
+    monkeypatch.setattr(bot_commands, "_run_openclaw_agent", fake_run_openclaw_agent)
+
+    first_reply = asyncio.run(
+        bot_commands._chatbot_reply(
+            db,
+            text="参考资料要用这种结构（原文链接：本田-川端康成 大纲）\n参考资料索引\nhttps://global.honda/en/heritage/episodes/1958manttrace.html",
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+        )
+    )
+    second_reply = asyncio.run(
+        bot_commands._chatbot_reply(
+            db,
+            text="请根据上面那条资料，先确认你是否读到了标题、原文链接和资料链接。",
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+        )
+    )
+
+    assert first_reply == "我读到了资料结构。"
+    assert second_reply == "我读到了标题、原文链接和资料链接。"
+    assert len(captured_calls) == 2
+    memory_contents = [item.content for item in ChatMemoryService(db, chat_id="oc_group", chat_type="group", sender_open_id="ou_alice").recent_messages()]
+    assert "参考资料要用这种结构（原文链接：本田-川端康成 大纲）\n参考资料索引\nhttps://global.honda/en/heritage/episodes/1958manttrace.html" in memory_contents
+    assert "我读到了资料结构。" in memory_contents
+
+
+def test_openclaw_agent_existing_session_does_not_duplicate_memory(monkeypatch, tmp_path):
+    db = make_db()
+    prefs = ChatPreferenceService(db)
+    prefs.set_assistant_mode(chat_id="oc_group", chat_type="group", sender_open_id="ou_alice", mode="agent")
+    ChatMemoryService(db, chat_id="oc_group", chat_type="group", sender_open_id="ou_alice").append_turn(
+        user_text="旧问题",
+        assistant_text="旧回答",
+    )
+    db.commit()
+
+    session_id = bot_commands._openclaw_agent_session_id(
+        chat_id="oc_group",
+        chat_type="group",
+        sender_open_id="ou_alice",
+        nonce=prefs.get_agent_session_nonce(chat_id="oc_group", chat_type="group", sender_open_id="ou_alice"),
+    )
+    existing = tmp_path / f"{session_id}.jsonl"
+    existing.write_text("{}\n")
+    monkeypatch.setattr(bot_commands, "_openclaw_agent_session_file", lambda _: existing)
+
+    captured: dict[str, object] = {}
+
+    class FakeFeishuClient:
+        async def add_message_reaction(self, message_id: str, emoji_type: str) -> dict:
+            return {"data": {"reaction_id": "r_001"}}
+
+        async def remove_message_reaction(self, message_id: str, reaction_id: str) -> dict:
+            return {"data": {}}
+
+    async def fake_run_openclaw_agent(*, session_id: str, message: str, timeout_seconds: int = 600, session_key: str | None = None, model: str | None = None) -> dict[str, object]:
+        captured["message"] = message
+        return {"result": {"finalAssistantVisibleText": "ok"}}
+
+    monkeypatch.setattr(bot_commands, "FeishuClient", FakeFeishuClient)
+    monkeypatch.setattr(bot_commands, "_run_openclaw_agent", fake_run_openclaw_agent)
+
+    reply = asyncio.run(
+        bot_commands._chatbot_reply(
+            db,
+            text="继续",
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+            source_message_id="om_msg_002",
+        )
+    )
+
+    assert reply == "ok"
+    assert captured["message"] == "继续"
+
+
+def test_agent_upload_request_uses_recent_local_artifact_and_returns_feishu_link(monkeypatch, tmp_path):
+    db = make_db()
+    prefs = ChatPreferenceService(db)
+    prefs.set_assistant_mode(chat_id="oc_group", chat_type="group", sender_open_id="ou_alice", mode="agent")
+    local_file = tmp_path / "wilhelm-ii-early-mercedes-factory-photo.png"
+    local_file.write_bytes(b"fake-image")
+    ChatMemoryService(db, chat_id="oc_group", chat_type="group", sender_open_id="ou_alice").append_turn(
+        user_text="生成一张图",
+        assistant_text=f"文件在这里：\n{local_file}",
+    )
+    db.commit()
+
+    captured: dict[str, object] = {}
+
+    class FakeWorkspace:
+        def __init__(self, feishu=None):
+            self.feishu = feishu
+
+        def folder_token_from_url(self, url: str | None) -> str | None:
+            return None
+
+        async def upload_file_with_fallback(self, *, target_folder: str | None, name: str, content: bytes):
+            captured["target_folder"] = target_folder
+            captured["name"] = name
+            captured["content"] = content
+            return {"data": {"file_token": "file_abc"}}, "workspace_root"
+
+    async def fail_openclaw(*args, **kwargs):
+        raise AssertionError("upload-to-feishu shortcut should bypass OpenClaw runtime")
+
+    monkeypatch.setattr(bot_commands, "FeishuWorkspaceService", FakeWorkspace)
+    monkeypatch.setattr(bot_commands, "_run_openclaw_agent", fail_openclaw)
+
+    reply = asyncio.run(
+        bot_commands._chatbot_reply(
+            db,
+            text="存到飞书里面来",
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+        )
+    )
+
+    assert "已存到飞书" in reply
+    assert "[打开文件](" in reply
+    assert "/file/file_abc)" in reply
+    assert captured["name"] == "wilhelm-ii-early-mercedes-factory-photo.png"
+    assert captured["content"] == b"fake-image"
+
+
+def test_openclaw_agent_session_id_is_isolated_between_group_and_private():
+    group_session = bot_commands._openclaw_agent_session_id(
+        chat_id="oc_group",
+        chat_type="group",
+        sender_open_id="ou_alice",
+        nonce=0,
+    )
+    private_session = bot_commands._openclaw_agent_session_id(
+        chat_id="oc_p2p",
+        chat_type="p2p",
+        sender_open_id="ou_alice",
+        nonce=0,
+    )
+
+    assert group_session != private_session
+    assert group_session.startswith("feishu-agent-")
+    assert private_session.startswith("feishu-agent-")
+
+
+def test_extract_openclaw_agent_reply_prefers_final_visible_text():
+    payload = {
+        "status": "ok",
+        "result": {
+            "finalAssistantVisibleText": "这是 OpenClaw 的最终可见回复",
+            "payloads": [
+                {"text": "备用 payload 文本"},
+            ],
+        },
+    }
+
+    assert bot_commands._extract_openclaw_agent_reply(payload) == "这是 OpenClaw 的最终可见回复"
+
+
+def test_extract_openclaw_agent_reply_falls_back_to_payload_text():
+    payload = {
+        "status": "ok",
+        "result": {
+            "payloads": [
+                {"text": "第一段 payload 文本"},
+            ],
+        },
+    }
+
+    assert bot_commands._extract_openclaw_agent_reply(payload) == "第一段 payload 文本"
+
+
+def test_new_session_only_bumps_current_agent_nonce(monkeypatch):
+    db = make_db()
+
+    class FakeFeishuClient:
+        async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> dict:
+            return {"ok": True}
+
+    monkeypatch.setattr(bot_commands, "FeishuClient", FakeFeishuClient)
+    preferences = ChatPreferenceService(db)
+    before_current = preferences.get_agent_session_nonce(
+        chat_id="oc_group",
+        chat_type="group",
+        sender_open_id="ou_alice",
+    )
+    before_other = preferences.get_agent_session_nonce(
+        chat_id="oc_other",
+        chat_type="group",
+        sender_open_id="ou_bob",
+    )
+
+    asyncio.run(
+        bot_commands.handle_bot_text(
+            db,
+            text="/New session",
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+        )
+    )
+
+    after_current = preferences.get_agent_session_nonce(
+        chat_id="oc_group",
+        chat_type="group",
+        sender_open_id="ou_alice",
+    )
+    after_other = preferences.get_agent_session_nonce(
+        chat_id="oc_other",
+        chat_type="group",
+        sender_open_id="ou_bob",
+    )
+
+    assert after_current == before_current + 1
+    assert after_other == before_other
+
+
+def test_stop_only_bumps_current_agent_nonce(monkeypatch):
+    db = make_db()
+
+    class FakeFeishuClient:
+        async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> dict:
+            return {"ok": True}
+
+    monkeypatch.setattr(bot_commands, "FeishuClient", FakeFeishuClient)
+    preferences = ChatPreferenceService(db)
+    before_current = preferences.get_agent_session_nonce(
+        chat_id="oc_group",
+        chat_type="group",
+        sender_open_id="ou_alice",
+    )
+    before_other = preferences.get_agent_session_nonce(
+        chat_id="oc_other",
+        chat_type="group",
+        sender_open_id="ou_bob",
+    )
+
+    asyncio.run(
+        bot_commands.handle_bot_text(
+            db,
+            text="/Stop",
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+        )
+    )
+
+    after_current = preferences.get_agent_session_nonce(
+        chat_id="oc_group",
+        chat_type="group",
+        sender_open_id="ou_alice",
+    )
+    after_other = preferences.get_agent_session_nonce(
+        chat_id="oc_other",
+        chat_type="group",
+        sender_open_id="ou_bob",
+    )
+
+    assert after_current == before_current + 1
+    assert after_other == before_other
+
+
+def test_stop_terminates_active_openclaw_process():
+    class FakeProcess:
+        def __init__(self) -> None:
+            self.returncode = None
+            self.terminated = False
+
+        def terminate(self) -> None:
+            self.terminated = True
+
+    process = FakeProcess()
+    bot_commands._ACTIVE_OPENCLAW_PROCESSES["group:oc_group"] = process
+
+    terminated = bot_commands._terminate_openclaw_process_for_session("group:oc_group")
+
+    assert terminated is True
+    assert process.terminated is True
+    assert "group:oc_group" not in bot_commands._ACTIVE_OPENCLAW_PROCESSES
+
+
+def test_chatbot_reply_uses_storyboard_breakdown_mode(monkeypatch):
+    db = make_db()
+    ChatPreferenceService(db).set_assistant_mode(
+        chat_id="oc_group",
+        chat_type="group",
+        sender_open_id="ou_alice",
+        mode="storyboard_breakdown",
+    )
+    db.commit()
+
+    captured: dict[str, object] = {}
+
+    async def fake_storyboard_breakdown_reply(*, query: str, messages: list[dict[str, str]], active_model: str, progress_notifier=None, request_context=None) -> str:
+        captured["query"] = query
+        captured["messages"] = messages
+        captured["active_model"] = active_model
+        return "分镜拆解结果"
+
+    monkeypatch.setattr(bot_commands, "_storyboard_breakdown_reply", fake_storyboard_breakdown_reply)
+
+    reply = asyncio.run(
+        bot_commands._chatbot_reply(
+            db,
+            text="请把这份文档拆成分镜",
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+        )
+    )
+
+    assert reply == "分镜拆解结果"
+    assert captured["query"] == "请把这份文档拆成分镜"
+    assert captured["active_model"] == "deepseek-v4-pro"
+    assert "分镜拆解" in captured["messages"][0]["content"]
     assert "当前绑定项目" not in captured["messages"][0]["content"]
     assert "不应注入的项目" not in captured["messages"][0]["content"]
     assert (
@@ -569,6 +1355,97 @@ def test_handle_card_action_supports_quick_assistant_buttons(monkeypatch):
     )
 
 
+def test_handle_card_action_uses_chat_id_from_card_value(monkeypatch):
+    db = make_db()
+    sent: list[tuple[str, str, str]] = []
+
+    class FakeFeishuClient:
+        async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> dict:
+            sent.append((receive_id, text, receive_id_type))
+            return {"ok": True}
+
+    monkeypatch.setattr(bot_commands, "FeishuClient", FakeFeishuClient)
+
+    result = asyncio.run(
+        bot_commands.handle_card_action(
+            db,
+            value={
+                "action": "assistant.set_mode",
+                "mode": "deep_research",
+                "chat_id": "oc_group_from_card",
+                "chat_type": "group",
+                "sender_open_id": "ou_alice",
+            },
+        )
+    )
+
+    assert result == {
+        "message": "聊天模式已切换",
+        "data": {"chat_id": "oc_group_from_card", "mode": "deep_research"},
+    }
+    assert sent == [
+        (
+            "oc_group_from_card",
+            "当前会话已切换为：Deep Research。请继续发送研究主题、文档链接或文件。",
+            "chat_id",
+        )
+    ]
+
+
+def test_handle_card_action_upload_recent_artifact(monkeypatch, tmp_path):
+    db = make_db()
+    local_file = tmp_path / "artifact.png"
+    local_file.write_bytes(b"artifact-bytes")
+    ChatMemoryService(db, chat_id="oc_group", chat_type="group", sender_open_id="ou_alice").append_turn(
+        user_text="帮我生成",
+        assistant_text=f"文件在这里：\n{local_file}",
+    )
+    db.commit()
+
+    sent: dict[str, object] = {}
+
+    class FakeFeishuClient:
+        async def send_card(self, receive_id: str, card: dict, receive_id_type: str = "chat_id") -> dict:
+            sent["receive_id"] = receive_id
+            sent["card"] = card
+            return {"ok": True}
+
+        async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> dict:
+            raise AssertionError("upload action should respond with card")
+
+    class FakeWorkspace:
+        def __init__(self, feishu=None):
+            self.feishu = feishu
+
+        async def upload_file_with_fallback(self, *, target_folder: str | None, name: str, content: bytes):
+            return {"data": {"file_token": "file_uploaded"}}, "workspace_root"
+
+        def folder_token_from_url(self, url: str | None) -> str | None:
+            return None
+
+    monkeypatch.setattr(bot_commands, "FeishuClient", FakeFeishuClient)
+    monkeypatch.setattr(bot_commands, "FeishuWorkspaceService", FakeWorkspace)
+
+    result = asyncio.run(
+        bot_commands.handle_card_action(
+            db,
+            value={
+                "action": "assistant.upload_recent_artifact",
+                "chat_id": "oc_group",
+                "chat_type": "group",
+                "sender_open_id": "ou_alice",
+            },
+            chat_id="oc_group",
+        )
+    )
+
+    assert result == {"message": "Agent 产物上传已处理", "data": {"chat_id": "oc_group"}}
+    assert sent["receive_id"] == "oc_group"
+    content = sent["card"]["elements"][0]["content"]
+    assert "已存到飞书" in content
+    assert "file_uploaded" in content
+
+
 def test_upload_direct_output_falls_back_when_project_folder_is_missing(monkeypatch):
     class FakeFeishuClient:
         def __init__(self):
@@ -604,15 +1481,35 @@ def test_upload_direct_output_falls_back_when_project_folder_is_missing(monkeypa
 
 
 def test_deep_research_reply_prefers_google_primary(monkeypatch):
+    captured: dict[str, object] = {}
+
     class FakeWorkspace:
         async def save_markdown_document(self, *, title: str, markdown: str, folder_token: str | None = None):
+            captured["folder_token"] = folder_token
             class Result:
-                url = "https://feishu.test/docx/research_doc"
+                pass
+
+            Result.url = "https://feishu.test/docx/research_doc"
+            Result.folder_token = folder_token or "dest_folder_123"
+            return Result()
+
+        async def save_text_file(self, *, filename: str, text: str, folder_token: str | None = None):
+            captured["raw_filename"] = filename
+            captured["raw_text"] = text
+            class Result:
+                url = "https://feishu.test/file/research_raw"
 
             return Result()
 
-    async def fake_google_deep_research_report(*, query: str, references: list[dict], project):
-        return f"# 研究报告\n\n{query}"
+        def folder_token_from_url(self, url: str | None) -> str | None:
+            return "dest_folder_123" if url else None
+
+    async def fake_google_deep_research_report(*, query: str, references: list[dict], progress_notifier=None):
+        return bot_commands.DeepResearchResult(
+            markdown=f"# 研究报告\n\n{query}",
+            raw_text=f"# 研究报告\n\n{query}",
+            raw_payload={"outputs": [{"text": f"# 研究报告\n\n{query}"}]},
+        )
 
     monkeypatch.setattr(settings, "google_api_key", "test-google")
     monkeypatch.setattr(settings, "google_deep_research_model", "deep-research-preview-04-2026")
@@ -623,8 +1520,7 @@ def test_deep_research_reply_prefers_google_primary(monkeypatch):
 
     reply = asyncio.run(
         bot_commands._deep_research_reply(
-            project=None,
-            query="研究 e.go 公司",
+            query="研究 e.go 公司，并保存到 https://feishu.test/drive/folder/dest_folder_123",
             messages=[{"role": "user", "content": "研究 e.go 公司"}],
             active_model="deepseek-v4-pro",
         )
@@ -633,23 +1529,103 @@ def test_deep_research_reply_prefers_google_primary(monkeypatch):
     assert "Gemini Deep Research" in reply
     assert "Fallback 搜索总结" not in reply
     assert "https://feishu.test/docx/research_doc" in reply
+    assert "https://feishu.test/file/research_raw" in reply
+    assert captured["folder_token"] == "dest_folder_123"
+    assert captured["raw_filename"].endswith("_raw.txt")
+    assert "=== raw_payload_json ===" in captured["raw_text"]
+
+
+def test_storyboard_breakdown_reply_saves_doc_and_raw_text(monkeypatch):
+    captured: dict[str, object] = {}
+
+    class FakeWorkspace:
+        async def ensure_storyboard_workspace_folder(self):
+            return {"folder_token": "storyboards"}
+
+        async def save_markdown_document(self, *, title: str, markdown: str, folder_token: str | None = None):
+            captured["folder_token"] = folder_token
+            captured["markdown"] = markdown
+            class Result:
+                pass
+
+            Result.url = "https://feishu.test/docx/storyboard_doc"
+            Result.folder_token = folder_token or "storyboards"
+            return Result()
+
+        async def save_text_file(self, *, filename: str, text: str, folder_token: str | None = None):
+            captured["raw_filename"] = filename
+            class Result:
+                url = "https://feishu.test/file/storyboard_raw"
+
+            return Result()
+
+        def folder_token_from_url(self, url: str | None) -> str | None:
+            return None
+
+    async def fake_generate_chat_response(*, model: str, messages: list[dict[str, str]], text: str, assistant_mode: str) -> str:
+        captured["model"] = model
+        captured["assistant_mode"] = assistant_mode
+        return "# 分镜需求\n\n## 镜头 1\n- 内容：开场"
+
+    monkeypatch.setattr(bot_commands, "FeishuWorkspaceService", FakeWorkspace)
+    monkeypatch.setattr(bot_commands, "_generate_chat_response", fake_generate_chat_response)
+
+    reply = asyncio.run(
+        bot_commands._storyboard_breakdown_reply(
+            query="请拆成分镜",
+            messages=[{"role": "system", "content": "stub"}, {"role": "user", "content": "原问题"}],
+            active_model="deepseek-v4-pro",
+        )
+    )
+
+    assert "分镜拆解已完成" in reply
+    assert "https://feishu.test/docx/storyboard_doc" in reply
+    assert "https://feishu.test/file/storyboard_raw" in reply
+    assert "# 分镜需求" not in reply
+    assert captured["folder_token"] == "storyboards"
+    assert captured["assistant_mode"] == "storyboard_breakdown"
+    assert captured["raw_filename"].endswith("_raw.txt")
+
+
+def test_reference_context_block_prefers_doc_text_content():
+    block = bot_commands._reference_context_block(
+        [
+            {
+                "type": "feishu_doc",
+                "url": "https://feishu.test/docx/doc_abc",
+                "text_content": "这是正文第一段\n这是正文第二段",
+                "content_json": {"content": [{"type": "text", "text": "不该优先展示的原始 JSON"}]},
+            }
+        ]
+    )
+
+    assert "这是正文第一段" in block
+    assert "不该优先展示的原始 JSON" not in block
 
 
 def test_deep_research_reply_marks_fallback_reason(monkeypatch):
     class FakeWorkspace:
         async def save_markdown_document(self, *, title: str, markdown: str, folder_token: str | None = None):
             class Result:
-                url = "https://feishu.test/docx/research_doc"
+                pass
+
+            Result.url = "https://feishu.test/docx/research_doc"
+            Result.folder_token = folder_token or "deep_research"
+            return Result()
+
+        async def save_text_file(self, *, filename: str, text: str, folder_token: str | None = None):
+            class Result:
+                url = "https://feishu.test/file/research_raw"
 
             return Result()
 
-    async def fail_google_deep_research_report(*, query: str, references: list[dict], project):
+    async def fail_google_deep_research_report(*, query: str, references: list[dict], progress_notifier=None):
         raise RuntimeError("gemini unavailable")
 
-    async def fail_openrouter_deep_research_report(*, query: str, references: list[dict], project):
+    async def fail_openrouter_deep_research_report(*, query: str, references: list[dict], progress_notifier=None):
         raise RuntimeError("openrouter unavailable")
 
-    async def fail_openai_deep_research_report(*, query: str, references: list[dict], project):
+    async def fail_openai_deep_research_report(*, query: str, references: list[dict], progress_notifier=None):
         raise RuntimeError("openai unavailable")
 
     async def fake_fallback_research_report(*, query: str, references: list[dict], active_model: str, messages: list[dict[str, str]]):
@@ -666,7 +1642,6 @@ def test_deep_research_reply_marks_fallback_reason(monkeypatch):
 
     reply = asyncio.run(
         bot_commands._deep_research_reply(
-            project=None,
             query="研究 e.go 公司",
             messages=[{"role": "user", "content": "研究 e.go 公司"}],
             active_model="deepseek-v4-pro",
@@ -688,7 +1663,9 @@ def test_format_google_interaction_response_reads_latest_text_step():
         ],
     }
 
-    assert bot_commands._format_google_interaction_response(payload) == "# 最终研究报告"
+    result = bot_commands._format_google_interaction_response(payload)
+    assert result.markdown == "# 最终研究报告"
+    assert result.raw_text == "# 最终研究报告"
 
 
 def test_format_google_interaction_response_prefers_outputs_over_steps():
@@ -700,7 +1677,39 @@ def test_format_google_interaction_response_prefers_outputs_over_steps():
         ],
     }
 
-    assert bot_commands._format_google_interaction_response(payload) == "# 完整研究报告\n\n这里是正文"
+    result = bot_commands._format_google_interaction_response(payload)
+    assert result.markdown == "# 完整研究报告\n\n这里是正文"
+
+
+def test_extract_google_interaction_text_avoids_source_only_block():
+    payload = {
+        "status": "completed",
+        "outputs": [
+            {"text": "**Sources:**\n1. https://example.com\n2. https://example.org"},
+            {"text": "# 结论摘要\n\n这是完整正文。\n\n## 时间线\n- 2020：开始量产"},
+        ],
+        "steps": [
+            {"content": [{"type": "text", "text": "https://example.com"}]},
+        ],
+    }
+
+    assert bot_commands._extract_google_interaction_text(payload) == "# 结论摘要\n\n这是完整正文。\n\n## 时间线\n- 2020：开始量产"
+
+
+def test_extract_google_interaction_text_merges_split_outputs_in_order():
+    payload = {
+        "status": "completed",
+        "outputs": [
+            {"text": "# 标题\n\n## 1. 开头\n这里是第一部分。"},
+            {"text": ""},
+            {"text": "### 4.2 中段\n这里是第二部分。"},
+            {"text": "**Sources:**\n1. https://example.com"},
+        ],
+    }
+
+    assert bot_commands._extract_google_interaction_text(payload) == (
+        "# 标题\n\n## 1. 开头\n这里是第一部分。\n\n### 4.2 中段\n这里是第二部分。"
+    )
 
 
 def test_deep_research_prompt_does_not_include_project_context():
@@ -710,11 +1719,70 @@ def test_deep_research_prompt_does_not_include_project_context():
     prompt = bot_commands._deep_research_prompt(
         query="研究 e.go 公司",
         references=[],
-        project=project,
     )
 
     assert "项目上下文不应出现" not in prompt
     assert "当前飞书项目" not in prompt
+
+
+def test_handle_bot_text_sends_deep_research_started_hint(monkeypatch):
+    db = make_db()
+    sent: list[tuple[str, str]] = []
+
+    class FakeFeishuClient:
+        async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> dict:
+            sent.append((receive_id, text))
+            return {"ok": True}
+
+        async def send_card(self, receive_id: str, card: dict, receive_id_type: str = "chat_id") -> dict:
+            sent.append((receive_id, card["elements"][0]["content"]))
+            return {"ok": True}
+
+    async def fake_google_deep_research_report(*, query: str, references: list[dict], progress_notifier=None):
+        if progress_notifier:
+            await progress_notifier("Deep Research 仍在进行中：Gemini 当前状态为 `in_progress`，已等待约 5 分钟。若长时间无结果，系统会自动回退到备用路径。")
+        return bot_commands.DeepResearchResult(markdown="# 报告正文", raw_text="# 报告正文", raw_payload={"outputs": [{"text": "# 报告正文"}]})
+
+    monkeypatch.setattr(bot_commands, "FeishuClient", FakeFeishuClient)
+    monkeypatch.setattr(settings, "google_api_key", "test-google")
+    monkeypatch.setattr(settings, "openrouter_api_key", "")
+    monkeypatch.setattr(settings, "openai_api_key", "")
+    monkeypatch.setattr(bot_commands, "_google_deep_research_report", fake_google_deep_research_report)
+
+    class FakeWorkspace:
+        async def save_markdown_document(self, *, title: str, markdown: str, folder_token: str | None = None):
+            class Result:
+                pass
+
+            Result.url = "https://feishu.test/docx/research_doc"
+            Result.folder_token = folder_token or "deep_research"
+            return Result()
+
+        async def save_text_file(self, *, filename: str, text: str, folder_token: str | None = None):
+            class Result:
+                url = "https://feishu.test/file/research_raw"
+
+            return Result()
+
+        def folder_token_from_url(self, url: str | None) -> str | None:
+            return None
+
+    monkeypatch.setattr(bot_commands, "FeishuWorkspaceService", FakeWorkspace)
+
+    result = asyncio.run(
+        bot_commands.handle_bot_text(
+            db,
+            text="/Deep Research 研究 e.go 公司",
+            chat_id="oc_p2p",
+            chat_type="p2p",
+            sender_open_id="ou_alice",
+        )
+    )
+
+    assert result["message"] == "聊天模式已切换并回复"
+    assert any("已开始 Deep Research" in message for _, message in sent)
+    assert any("仍在进行中" in message for _, message in sent)
+    assert any("40 分钟后自动回退" in message for _, message in sent)
 
 
 def test_chatbot_reply_injects_search_context_for_deepseek(monkeypatch):

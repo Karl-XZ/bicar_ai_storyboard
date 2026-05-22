@@ -98,7 +98,7 @@ class ChatMemoryService:
 def resolve_chat_session(*, chat_id: str | None, chat_type: str | None, sender_open_id: str | None) -> ChatSession:
     normalized_chat_type = (chat_type or "").strip().lower()
     if normalized_chat_type in {"p2p", "private"}:
-        identity = sender_open_id or chat_id or settings.feishu_default_chat_id or "default"
+        identity = sender_open_id or chat_id or "anonymous_private"
         return ChatSession(
             session_key=f"private:{identity}",
             session_type="private",
@@ -106,7 +106,7 @@ def resolve_chat_session(*, chat_id: str | None, chat_type: str | None, sender_o
             sender_open_id=sender_open_id,
         )
 
-    identity = chat_id or settings.feishu_default_chat_id or sender_open_id or "default"
+    identity = chat_id or sender_open_id or "anonymous_group"
     return ChatSession(
         session_key=f"group:{identity}",
         session_type="group",

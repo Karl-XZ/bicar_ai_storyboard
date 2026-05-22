@@ -46,7 +46,10 @@ class FeishuWorkspaceService:
             moved_items = 0
             source_token = settings.feishu_root_folder_token
             if source_token and source_token != target_token:
-                moved_items = await self.move_all_items(source_folder_token=source_token, target_folder_token=target_token)
+                try:
+                    moved_items = await self.move_all_items(source_folder_token=source_token, target_folder_token=target_token)
+                except FeishuApiError:
+                    moved_items = 0
             return {
                 "folder_token": target_token,
                 "folder_url": self._extract_url(target_folder) or self._drive_folder_url(target_token),
@@ -116,19 +119,45 @@ class FeishuWorkspaceService:
         return moved
 
     async def save_markdown_document(self, *, title: str, markdown: str, folder_token: str | None = None) -> FeishuDocumentResult:
-        target_folder = folder_token
+        target_folder = str(folder_token).strip() if folder_token else ""
+        deep_research_folder = await self.ensure_deep_research_workspace_folder()
+        fallback_folder = str(deep_research_folder.get("folder_token") or settings.feishu_root_folder_token or "root")
         if not target_folder:
-            ensured = await self.ensure_deep_research_workspace_folder()
-            target_folder = str(ensured.get("folder_token") or settings.feishu_root_folder_token or "root")
+            target_folder = fallback_folder
         filename = f"{title}.docx"
         content = self._render_markdown_docx(title=title, markdown=markdown)
-        upload, resolved_folder = await self.upload_file_with_fallback(target_folder=target_folder, name=filename, content=content)
+        try:
+            upload = await self.feishu.upload_file(target_folder, filename, content)
+            resolved_folder = target_folder
+        except FeishuApiError as exc:
+            if not self._is_missing_parent_folder_error(exc):
+                raise
+            if not fallback_folder or fallback_folder == target_folder:
+                raise FeishuApiError(f"Feishu HTTP error: missing folder and no fallback available for {target_folder}")
+            upload = await self.feishu.upload_file(fallback_folder, filename, content)
+            resolved_folder = fallback_folder
         file_token = str((upload.get("data") or {}).get("file_token") or (upload.get("data") or {}).get("file", {}).get("file_token") or "")
         return FeishuDocumentResult(
             document_id=file_token or title,
             url=self._drive_file_url(file_token) if file_token else self._drive_folder_url(resolved_folder),
             folder_token=resolved_folder,
         )
+
+    async def save_text_file(self, *, filename: str, text: str, folder_token: str | None = None) -> FeishuDocumentResult:
+        upload, resolved_folder = await self.upload_file_with_fallback(
+            target_folder=folder_token,
+            name=filename,
+            content=(text or "").encode("utf-8"),
+        )
+        file_token = str((upload.get("data") or {}).get("file_token") or (upload.get("data") or {}).get("file", {}).get("file_token") or "")
+        return FeishuDocumentResult(
+            document_id=file_token or filename,
+            url=self._drive_file_url(file_token) if file_token else self._drive_folder_url(resolved_folder),
+            folder_token=resolved_folder,
+        )
+
+    def folder_token_from_url(self, url: str | None) -> str | None:
+        return self._folder_token_from_url(url)
 
     async def upload_file_with_fallback(self, *, target_folder: str | None, name: str, content: bytes) -> tuple[dict, str]:
         primary_folder = str(target_folder or settings.feishu_root_folder_token or "root")
@@ -175,11 +204,13 @@ class FeishuWorkspaceService:
         document_id = self._document_id_from_url(value)
         if document_id:
             raw = await self.feishu.get_document_raw_content(document_id)
+            content_json = raw.get("data") or raw
             return {
                 "type": "feishu_doc",
                 "document_id": document_id,
                 "url": self._doc_url(document_id),
-                "content_json": raw.get("data") or raw,
+                "content_json": content_json,
+                "text_content": self._decode_document_content(content_json),
             }
         file_token = self._file_token_from_url(value) or self._feishu_token(value)
         if file_token:
@@ -278,6 +309,21 @@ class FeishuWorkspaceService:
 
     def _decode_file_content(self, content: bytes, *, mime_type: str, filename: str) -> str:
         suffix = Path(filename).suffix.lower()
+        if suffix == ".docx":
+            try:
+                document = Document(io.BytesIO(content))
+                paragraphs = [paragraph.text.strip() for paragraph in document.paragraphs if paragraph.text.strip()]
+                table_rows: list[str] = []
+                for table in document.tables:
+                    for row in table.rows:
+                        cells = [cell.text.strip() for cell in row.cells]
+                        if any(cells):
+                            table_rows.append(" | ".join(cells))
+                combined = paragraphs + table_rows
+                if combined:
+                    return "\n".join(combined)
+            except Exception:
+                pass
         if mime_type.startswith("text/") or suffix in {".md", ".markdown", ".txt", ".json", ".csv", ".tsv"}:
             try:
                 return content.decode("utf-8")
@@ -289,6 +335,68 @@ class FeishuWorkspaceService:
             except Exception:
                 pass
         return f"[binary file omitted] mime_type={mime_type} filename={filename} bytes={len(content)}"
+
+    def _decode_document_content(self, payload: dict | str | list | None) -> str:
+        if payload is None:
+            return ""
+        if isinstance(payload, str):
+            stripped = payload.strip()
+            if not stripped:
+                return ""
+            try:
+                parsed = json.loads(stripped)
+            except Exception:
+                return stripped
+            return self._decode_document_content(parsed)
+
+        text_chunks: list[str] = []
+        seen: set[str] = set()
+
+        def append(value: str) -> None:
+            normalized = re.sub(r"\s+", " ", str(value or "")).strip()
+            if not normalized or normalized in seen:
+                return
+            seen.add(normalized)
+            text_chunks.append(normalized)
+
+        def walk(value) -> None:
+            if value is None:
+                return
+            if isinstance(value, str):
+                append(value)
+                return
+            if isinstance(value, list):
+                for item in value:
+                    walk(item)
+                return
+            if not isinstance(value, dict):
+                return
+
+            for key in ("raw_content", "markdown", "text", "title", "header", "body", "content"):
+                nested = value.get(key)
+                if isinstance(nested, str):
+                    append(nested)
+                elif isinstance(nested, (list, dict)):
+                    walk(nested)
+
+            elements = (
+                value.get("elements"),
+                value.get("blocks"),
+                value.get("children"),
+                value.get("paragraphs"),
+                value.get("paragraph"),
+                value.get("rows"),
+                value.get("cells"),
+            )
+            for nested in elements:
+                if nested is not None:
+                    walk(nested)
+
+            if value.get("type") == "text" and isinstance(value.get("text"), str):
+                append(value["text"])
+
+        walk(payload)
+        return "\n".join(text_chunks).strip()
 
     def _render_markdown_docx(self, *, title: str, markdown: str) -> bytes:
         html = markdown_lib.markdown(

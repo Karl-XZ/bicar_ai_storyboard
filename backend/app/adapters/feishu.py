@@ -40,6 +40,19 @@ class FeishuClient:
             json={"receive_id": receive_id, "msg_type": "text", "content": json.dumps({"text": text}, ensure_ascii=False)},
         )
 
+    async def add_message_reaction(self, message_id: str, emoji_type: str) -> dict:
+        return await self._request(
+            "POST",
+            f"/open-apis/im/v1/messages/{message_id}/reactions",
+            json={"reaction_type": {"emoji_type": emoji_type}},
+        )
+
+    async def remove_message_reaction(self, message_id: str, reaction_id: str) -> dict:
+        return await self._request(
+            "DELETE",
+            f"/open-apis/im/v1/messages/{message_id}/reactions/{reaction_id}",
+        )
+
     async def create_bitable_app(self, name: str, folder_token: str = "") -> dict:
         body: dict[str, Any] = {"name": name}
         if folder_token:
