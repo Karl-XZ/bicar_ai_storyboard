@@ -20,6 +20,64 @@
 
 ---
 
+## 演示截图
+
+下面是一组从飞书移动端截取的完整流程示例：从 Agent 能力说明、文档/分镜需求发起，到项目创建、分镜表编辑、图片/视频生成与进度反馈。
+
+<table>
+  <tr>
+    <td width="33%" align="center">
+      <img src="../docs/assets/readme-demo/01-agent-capabilities.jpg" alt="Agent 能力说明" width="100%">
+      <br>
+      <sub>Agent 能力说明</sub>
+    </td>
+    <td width="33%" align="center">
+      <img src="../docs/assets/readme-demo/02-doc-to-storyboard-request.jpg" alt="基于文档发起分镜制作需求" width="100%">
+      <br>
+      <sub>基于文档发起分镜制作需求</sub>
+    </td>
+    <td width="33%" align="center">
+      <img src="../docs/assets/readme-demo/03-project-created-card.jpg" alt="分镜项目创建成功卡片" width="100%">
+      <br>
+      <sub>分镜项目创建成功卡片</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="33%" align="center">
+      <img src="../docs/assets/readme-demo/04-storyboard-table-list.jpg" alt="飞书多维表分镜列表" width="100%">
+      <br>
+      <sub>飞书多维表分镜列表</sub>
+    </td>
+    <td width="33%" align="center">
+      <img src="../docs/assets/readme-demo/05-shot-prompt-detail.jpg" alt="单镜头描述与 Prompt 字段" width="100%">
+      <br>
+      <sub>单镜头描述与 Prompt 字段</sub>
+    </td>
+    <td width="33%" align="center">
+      <img src="../docs/assets/readme-demo/06-generation-settings.jpg" alt="模型、首尾帧与生成设置" width="100%">
+      <br>
+      <sub>模型、首尾帧与生成设置</sub>
+    </td>
+  </tr>
+  <tr>
+    <td width="33%" align="center">
+      <img src="../docs/assets/readme-demo/07-video-result-status.jpg" alt="视频生成结果与状态" width="100%">
+      <br>
+      <sub>视频生成结果与状态</sub>
+    </td>
+    <td width="33%" align="center">
+      <img src="../docs/assets/readme-demo/08-agent-progress-card.jpg" alt="Agent 生成进度反馈" width="100%">
+      <br>
+      <sub>Agent 生成进度反馈</sub>
+    </td>
+    <td width="33%" align="center">
+      <em>更多示例可继续补充</em>
+    </td>
+  </tr>
+</table>
+
+---
+
 ## 1. 项目结构
 
 常见目录如下：
