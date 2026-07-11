@@ -4,7 +4,7 @@ import json
 import httpx
 
 from app.core.config import settings
-from app.providers.xyq_nest import XYQNestVideoProvider
+from app.providers.xyq_nest import XYQNestVideoProvider, _build_video_message
 
 
 class FakeAsyncClient:
@@ -255,3 +255,29 @@ def test_xyq_provider_polls_stringified_artifact_payload(monkeypatch):
     assert result["status"] == "succeeded"
     assert result["video_bytes"] == b"video-bytes"
     assert result["mime_type"] == "video/mp4"
+
+
+def test_xyq_video_message_emphasizes_start_end_frame_constraints():
+    message = _build_video_message(
+        {
+            "prompt": "豪华后排接电话镜头",
+            "model": "小云雀",
+            "duration_seconds": 3.5,
+            "keyframe_urls": ["feishu://keyframe_token"],
+            "keyframe_time_seconds": 2.5,
+        },
+        uploaded_assets=[
+            type("Asset", (), {"label": "首帧参考", "asset_id": "a1"})(),
+            type("Asset", (), {"label": "尾帧参考", "asset_id": "a2"})(),
+            type("Asset", (), {"label": "关键帧参考1", "asset_id": "a3"})(),
+        ],
+    )
+
+    assert "目标时长：3.5 秒" in message
+    assert "首尾帧强约束" in message
+    assert "第一帧必须尽可能贴近“首帧参考”" in message
+    assert "最后一帧必须尽可能贴近“尾帧参考”" in message
+    assert "不允许把尾帧内容提前到开头" in message
+    assert "不能交换起止语义" in message
+    assert "关键帧时间约束" in message
+    assert "第 2.5 秒附近" in message

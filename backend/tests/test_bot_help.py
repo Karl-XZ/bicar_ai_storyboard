@@ -1,4 +1,4 @@
-from app.adapters.feishu_cards import chatbot_reply_card, help_card, render_feishu_markdown
+from app.adapters.feishu_cards import chatbot_reply_card, help_card, progress_card, render_feishu_markdown
 from app.api.routes.webhooks import _is_help_command, _message_text
 from app.services.bot_commands import (
     _extract_message_urls,
@@ -39,6 +39,8 @@ def test_help_card_contains_core_commands():
     assert "生成状态" in content
     assert "重新生成状态" in content
     assert "满意度" in content
+    assert "视频时长" in content
+    assert "关键帧时间点" in content
 
 
 def test_create_project_command_aliases():
@@ -131,6 +133,8 @@ def test_text_project_commands_parse_to_card_actions():
         "batch_no": "batch_001",
     }
     assert _parse_project_command("同步表格") == {"action": "project.sync", "batch_no": "batch_001"}
+    assert _parse_project_command("查询进度") == {"action": "project.progress", "batch_no": "batch_001"}
+    assert _parse_project_command("表格链接") == {"action": "project.progress", "batch_no": "batch_001"}
 
 
 def test_chatbot_model_command_allows_new_providers():
@@ -200,14 +204,16 @@ def test_direct_image_command_parses_model_prompt_and_reference():
 
 def test_direct_video_command_parses_frames_and_duration():
     command = _parse_direct_generation_command(
-        "直接生成视频 模型=小云雀 提示词=镜头缓慢推近 首帧=https://foo.feishu.cn/file/first 尾帧=https://foo.feishu.cn/file/last 时长=5"
+        "直接生成视频 模型=小云雀 提示词=镜头缓慢推近 首帧=https://foo.feishu.cn/file/first 尾帧=https://foo.feishu.cn/file/last 关键帧=https://foo.feishu.cn/file/key 时长=3.5 关键帧时间点=2.5"
     )
     assert command is not None
     assert command.kind == "video"
     assert command.model == "小云雀"
-    assert command.duration_seconds == 5
+    assert command.duration_seconds == 3.5
+    assert command.keyframe_time_seconds == 2.5
     assert command.first_frame == ("https://foo.feishu.cn/file/first",)
     assert command.last_frame == ("https://foo.feishu.cn/file/last",)
+    assert command.keyframes == ("https://foo.feishu.cn/file/key",)
 
 
 def test_chatbot_reply_card_uses_markdown_block():
@@ -248,3 +254,21 @@ def test_render_feishu_markdown_converts_gfm_table_to_feishu_table_tag():
 def test_render_feishu_markdown_downgrades_h3_to_bold():
     rendered = render_feishu_markdown("### 第三级标题\n正文")
     assert rendered.splitlines()[0] == "**第三级标题**"
+
+
+def test_progress_card_embeds_table_and_folder_links_in_markdown():
+    card = progress_card(
+        project_name="测试项目",
+        stats={"total": 12},
+        table_url="https://example.com/base/app?table=tbl",
+        folder_url="https://example.com/drive/folder/fld",
+        project_id="proj_123",
+    )
+    content = card["elements"][0]["content"]
+    assert "表格链接：https://example.com/base/app?table=tbl" in content
+    assert "项目文件夹链接：https://example.com/drive/folder/fld" in content
+
+
+def test_render_feishu_markdown_expands_markdown_links_to_visible_urls():
+    rendered = render_feishu_markdown("表格链接：[打开分镜表](https://example.com/base/app?table=tbl)")
+    assert rendered == "表格链接：打开分镜表：https://example.com/base/app?table=tbl"

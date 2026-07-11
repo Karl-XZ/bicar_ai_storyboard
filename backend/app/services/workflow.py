@@ -33,6 +33,8 @@ RATE_LIMIT_PATTERNS = (
     r"throttl",
     r"insufficient_quota",
     r"quota exceeded",
+    r"非vip用户",
+    r"无法使用该功能",
 )
 
 
@@ -168,6 +170,7 @@ class WorkflowService:
                     "prompt_hash": prompt_hash,
                     "prompt": frame_prompt,
                     "negative_prompt": (shot.prompts or {}).get("negative_prompt"),
+                    "reference_image_urls": (shot.prompts or {}).get("reference_image_urls") or [],
                     "model": model_id,
                     "size": size,
                 },
@@ -213,6 +216,7 @@ class WorkflowService:
             shot.status = ShotStatus.APPROVED.value
         video_inputs = self._video_input_assets(shot)
         provider, model_id = self._provider_model(shot, "video")
+        duration_seconds = self._video_duration(shot)
 
         key = make_idempotency_key(
             "video",
@@ -224,6 +228,8 @@ class WorkflowService:
             video_inputs.get("reference_image_url"),
             video_inputs.get("keyframe_asset_ids"),
             (shot.prompts or {}).get("video_run_id"),
+            duration_seconds,
+            video_inputs.get("keyframe_time_seconds"),
             provider,
             model_id,
         )
@@ -241,7 +247,8 @@ class WorkflowService:
                 "negative_prompt": (shot.prompts or {}).get("negative_prompt"),
                 "camera_motion": (shot.prompts or {}).get("camera_motion"),
                 "model": model_id,
-                "duration_seconds": self._video_duration(shot),
+                "duration_seconds": duration_seconds,
+                "keyframe_time_seconds": video_inputs.get("keyframe_time_seconds"),
             },
             provider=provider,
             model_id=model_id,
@@ -611,7 +618,9 @@ class WorkflowService:
                 inferred = "nano_banana_2"
         elif normalized.startswith("deepseek_v4") or normalized.startswith("deepseek_chat") or normalized.startswith("deepseek_reasoner"):
             inferred = "deepseek"
-        elif normalized in {"gpt2", "gpt_image_2", "gpt_image_1", "openai_gpt_5.4_image_2"}:
+        elif normalized in {"gpt2", "openai_gpt_5.4_image_2"}:
+            inferred = "openrouter"
+        elif normalized in {"gpt_image_2", "gpt_image_1"}:
             inferred = "openrouter" if settings.openrouter_api_key else "openai"
         elif normalized.startswith(("qwen", "wan", "z_image")):
             inferred = "dashscope"
@@ -647,32 +656,49 @@ class WorkflowService:
             FrameType.LAST_FRAME: "last_frame_prompt",
             FrameType.KEYFRAME: "keyframe_prompt",
         }[frame_type]
-        return prompts.get(key) or prompts.get("keyframe_prompt") or shot.scene_description
+        base_prompt = prompts.get(key) or prompts.get("keyframe_prompt") or shot.scene_description
+        return self._apply_reference_image_notes(base_prompt, shot)
 
     def _image_size_for_shot(self, shot: Shot) -> str:
         project = self.projects.get_project(shot.project_id)
         aspect_ratio = ((project.workflow_config or {}).get("aspect_ratio") if project else None) or "16:9"
         return {"16:9": "1280*720", "9:16": "720*1280", "1:1": "1024*1024"}.get(aspect_ratio, settings.dashscope_image_size)
 
-    def _video_duration(self, shot: Shot) -> int | None:
+    def _video_duration(self, shot: Shot) -> float | None:
+        prompts = shot.prompts or {}
+        prompt_duration = prompts.get("duration_seconds")
+        if prompt_duration:
+            return self._normalize_duration(prompt_duration)
         project = self.projects.get_project(shot.project_id)
         if not project:
             return None
         video_config = (project.model_config or {}).get("video") or {}
         duration = video_config.get("duration_seconds") or (project.workflow_config or {}).get("duration_seconds")
-        return int(duration) if duration else None
+        return self._normalize_duration(duration) if duration else None
+
+    def _normalize_duration(self, duration) -> float | None:
+        try:
+            value = float(duration)
+        except (TypeError, ValueError):
+            return None
+        if value <= 0:
+            return None
+        return min(value, 60.0)
 
     def _video_input_assets(self, shot: Shot) -> dict:
         first = self.assets.latest_for_shot(shot.id, AssetType.FIRST_FRAME)
         last = self.assets.latest_for_shot(shot.id, AssetType.LAST_FRAME)
         keyframes = self.assets.list_for_shot(shot.id, AssetType.KEYFRAME)
         prompts = shot.prompts or {}
-        video_prompt = prompts.get("video_prompt") or shot.scene_description
+        video_prompt = self._apply_reference_image_notes(prompts.get("video_prompt") or shot.scene_description, shot)
         if not video_prompt:
             raise WorkflowError("VIDEO_INPUT_INCOMPLETE", "缺少视频 Prompt 或场景描述")
 
         selected_tokens = prompts.get("selected_keyframe_tokens") or []
         selected = [asset for asset in keyframes if asset.feishu_file_token in selected_tokens] if selected_tokens else keyframes[:1]
+        selected_keyframe_urls = [asset.public_url for asset in selected]
+        if not selected_keyframe_urls:
+            selected_keyframe_urls = [str(url) for url in (prompts.get("selected_keyframe_urls") or []) if url]
         reference_urls = prompts.get("reference_image_urls") or []
         reference_image_url = reference_urls[0] if reference_urls else None
         return {
@@ -680,8 +706,42 @@ class WorkflowService:
             "first_frame_url": first.public_url if first else None,
             "last_frame_url": last.public_url if last else None,
             "reference_image_url": reference_image_url,
-            "keyframe_urls": [asset.public_url for asset in selected],
+            "keyframe_urls": selected_keyframe_urls,
             "first_frame_asset_id": str(first.id) if first else None,
             "last_frame_asset_id": str(last.id) if last else None,
             "keyframe_asset_ids": [str(asset.id) for asset in selected],
+            "keyframe_time_seconds": self._normalize_keyframe_time(prompts.get("keyframe_time_seconds")),
         }
+
+    def _normalize_keyframe_time(self, value) -> float | None:
+        try:
+            time_seconds = float(value)
+        except (TypeError, ValueError):
+            return None
+        if time_seconds < 0:
+            return None
+        return time_seconds
+
+    def _apply_reference_image_notes(self, base_prompt: str | None, shot: Shot) -> str:
+        prompt = (base_prompt or "").strip()
+        notes = self._reference_image_notes(shot)
+        if not notes:
+            return prompt
+        guidance = (
+            f"参考图使用说明：这张参考图仅用于镜头中的以下部分参考：{notes}。"
+            "不要机械复刻整张图，只吸收与该说明相关的局部元素。"
+        )
+        if not prompt:
+            return guidance
+        return f"{prompt}\n\n{guidance}"
+
+    def _reference_image_notes(self, shot: Shot) -> str:
+        prompts = shot.prompts or {}
+        notes = str(prompts.get("reference_image_notes") or "").strip()
+        reference_urls = prompts.get("reference_image_urls") or []
+        reference_tokens = prompts.get("reference_tokens") or []
+        if not notes:
+            return ""
+        if not reference_urls and not reference_tokens:
+            return ""
+        return notes

@@ -156,6 +156,32 @@ class FeishuWorkspaceService:
             folder_token=resolved_folder,
         )
 
+    async def copy_local_docx_to_workspace(
+        self,
+        *,
+        source_path: str | Path,
+        title: str,
+        folder_token: str | None = None,
+    ) -> FeishuDocumentResult:
+        path = Path(source_path).expanduser()
+        if not path.exists() or not path.is_file():
+            raise FileNotFoundError(f"模板文件不存在：{path}")
+        if path.suffix.lower() != ".docx":
+            raise ValueError(f"模板文件必须是 .docx：{path.name}")
+        filename = self._docx_filename(title)
+        target_folder = folder_token or await self.default_upload_folder_token()
+        upload, resolved_folder = await self.upload_file_with_fallback(
+            target_folder=target_folder,
+            name=filename,
+            content=path.read_bytes(),
+        )
+        file_token = str((upload.get("data") or {}).get("file_token") or (upload.get("data") or {}).get("file", {}).get("file_token") or "")
+        return FeishuDocumentResult(
+            document_id=file_token or filename,
+            url=self._drive_file_url(file_token) if file_token else self._drive_folder_url(resolved_folder),
+            folder_token=resolved_folder,
+        )
+
     def folder_token_from_url(self, url: str | None) -> str | None:
         return self._folder_token_from_url(url)
 
@@ -198,6 +224,14 @@ class FeishuWorkspaceService:
     async def default_workspace_folder_token(self) -> str:
         ensured = await self.ensure_default_workspace_folder()
         return str(ensured.get("folder_token") or settings.feishu_root_folder_token or "root")
+
+    async def default_upload_folder_token(self) -> str:
+        parent_token = self._folder_token_from_url(getattr(settings, "feishu_workspace_parent_url", "")) or settings.feishu_root_folder_token or "root"
+        try:
+            target_folder = await self.ensure_named_folder(parent_token=parent_token, name=settings.feishu_workspace_folder_name)
+            return self._extract_token(target_folder) or settings.feishu_root_folder_token or "root"
+        except FeishuApiError:
+            return settings.feishu_root_folder_token or "root"
 
     async def read_reference(self, url_or_token: str) -> dict:
         value = str(url_or_token or "").strip()
@@ -271,6 +305,15 @@ class FeishuWorkspaceService:
         data = response.get("data", {})
         return data.get("url") or data.get("node", {}).get("url")
 
+    def _docx_filename(self, title: str) -> str:
+        value = re.sub(r"\s+", " ", str(title or "").strip())
+        value = re.sub(r'[\\/:*?"<>|]+', "_", value).strip(" .")
+        if value.lower().endswith(".docx"):
+            value = value[:-5].strip(" .")
+        if not value:
+            raise ValueError("文件名不能为空")
+        return f"{value[:120]}.docx"
+
     def _is_missing_parent_folder_error(self, exc: Exception) -> bool:
         message = str(exc).lower()
         return "parent node not exist" in message or ("parent node" in message and "not exist" in message)
@@ -304,6 +347,10 @@ class FeishuWorkspaceService:
         return f"{self._feishu_site_url()}/file/{file_token}"
 
     def _feishu_site_url(self) -> str:
+        for configured_url in (settings.feishu_workspace_parent_url, settings.debug_paper_target_folder_url):
+            netloc = urlparse(str(configured_url or "")).netloc
+            if netloc:
+                return f"https://{netloc}"
         domain = settings.feishu_base_url.replace("https://open.", "").replace("http://open.", "")
         return f"https://{domain}"
 

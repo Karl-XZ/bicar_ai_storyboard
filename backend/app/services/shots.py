@@ -53,10 +53,14 @@ class ShotService:
             "negative_prompt": self._plain(fields.get("负面 Prompt")),
             "camera_motion": self._plain(fields.get("镜头运动")),
             "consistency_notes": self._plain(fields.get("一致性说明")),
+            "reference_image_notes": self._plain(fields.get("参考图批注")),
             "text_model": self._single_select(fields.get("文本模型")),
             "image_model": normalize_image_model(self._single_select(fields.get("图片模型"))),
             "video_model": normalize_video_model(self._single_select(fields.get("视频模型"))),
             "selected_keyframe_tokens": self._attachment_tokens(fields.get("选中关键帧图")),
+            "selected_keyframe_urls": self._attachment_sources(fields.get("选中关键帧图")),
+            "keyframe_time_seconds": self._number(fields.get("关键帧时间点")),
+            "duration_seconds": self._number(fields.get("视频时长")),
             "reference_tokens": self._attachment_tokens(fields.get("参考图")),
             "reference_image_urls": self._attachment_sources(fields.get("参考图")),
             "transition_alignment": self._single_select(fields.get("首帧同步设置")) or "否",
@@ -146,15 +150,15 @@ class ShotService:
                     values.append(str(selected))
         return values
 
-    def _number(self, value) -> int | None:
+    def _number(self, value) -> float | None:
         if value in (None, ""):
             return None
         if isinstance(value, (int, float)):
-            return int(value)
+            return float(value)
         if isinstance(value, dict):
             return self._number(value.get("value") or value.get("text") or value.get("name"))
         try:
-            return int(str(value).strip())
+            return float(str(value).strip())
         except ValueError:
             return None
 
@@ -188,6 +192,9 @@ class ShotService:
         merged = dict(current)
         force_sync_keys = {
             "selected_keyframe_tokens",
+            "selected_keyframe_urls",
+            "keyframe_time_seconds",
+            "duration_seconds",
             "reference_tokens",
             "reference_image_urls",
             "transition_alignment",

@@ -239,6 +239,30 @@ def test_workspace_service_decodes_docx_file_text():
     assert "1 | 夜景穿梭" in text
 
 
+def test_workspace_service_copies_local_docx_with_requested_name(tmp_path):
+    source = tmp_path / "source.docx"
+    doc = Document()
+    doc.add_paragraph("调试纸模板")
+    doc.save(source)
+    fake = FakeFeishuClient()
+    service = FeishuWorkspaceService(feishu=fake)
+
+    result = asyncio.run(
+        service.copy_local_docx_to_workspace(
+            source_path=source,
+            title=" 调试/纸CN.docx ",
+            folder_token="target_folder",
+        )
+    )
+
+    assert result.document_id == "file_123"
+    assert result.folder_token == "target_folder"
+    assert result.url.endswith("/file/file_123")
+    assert fake.uploads[0][0] == "target_folder"
+    assert fake.uploads[0][1] == "调试_纸CN.docx"
+    assert fake.uploads[0][2] == source.read_bytes()
+
+
 def test_workspace_service_uploads_to_default_workspace_when_target_folder_is_missing(monkeypatch):
     monkeypatch.setattr(settings, "feishu_workspace_parent_url", "https://feishu.test/drive/folder/parent_folder")
     monkeypatch.setattr(settings, "feishu_workspace_folder_name", "AI生成")

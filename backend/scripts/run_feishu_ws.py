@@ -21,8 +21,10 @@ from app.api.routes.webhooks import _message_text  # noqa: E402
 from app.core.config import settings  # noqa: E402
 from app.db.session import SessionLocal  # noqa: E402
 from app.services.bot_commands import handle_bot_text, handle_card_action  # noqa: E402
+from app.services.debug_paper_form import DebugPaperFormService  # noqa: E402
 from app.services.feishu_storyboard import FeishuStoryboardService  # noqa: E402
 from app.services.projects import ProjectService  # noqa: E402
+from app.services.video_downloads import VideoDownloadService  # noqa: E402
 
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
@@ -69,7 +71,7 @@ def on_message_receive(data) -> None:
         ],
     }
     text = _message_text(message_payload)
-    chat_id = message.chat_id or settings.feishu_default_chat_id
+    chat_id = message.chat_id
     chat_type = message.chat_type
     message_id = message.message_id
     sender_open_id = sender_id.open_id if sender_id else None
@@ -79,7 +81,7 @@ def on_message_receive(data) -> None:
 
 def on_card_action(data) -> P2CardActionTriggerResponse:
     value: dict[str, Any] = (data.event.action.value if data.event and data.event.action else {}) or {}
-    chat_id = data.event.context.open_chat_id if data.event and data.event.context else settings.feishu_default_chat_id
+    chat_id = data.event.context.open_chat_id if data.event and data.event.context else None
     operator_open_id = data.event.operator.open_id if data.event and data.event.operator else None
     if operator_open_id and "sender_open_id" not in value:
         value["sender_open_id"] = operator_open_id
@@ -162,6 +164,14 @@ def _run_bitable_table_sync(app_token: str, table_id: str) -> None:
     try:
         project = ProjectService(db).find_by_feishu_table(app_token, table_id)
         if not project:
+            debug_paper = DebugPaperFormService()
+            if asyncio.run(debug_paper.handles_table(app_token, table_id)):
+                logger.info("bitable debug-paper table change ignored without explicit record_id app_token=%s table_id=%s", app_token, table_id)
+                return
+            video_downloads = VideoDownloadService()
+            if asyncio.run(video_downloads.handles_table(app_token, table_id)):
+                logger.info("bitable video-download table change ignored without explicit record_id app_token=%s table_id=%s", app_token, table_id)
+                return
             logger.warning("bitable project not found app_token=%s table_id=%s", app_token, table_id)
             return
         asyncio.run(FeishuStoryboardService(db).sync_from_feishu(project))
@@ -179,19 +189,51 @@ def _run_single_record_changed(app_token: str, table_id: str, record_id: str) ->
         try:
             project = ProjectService(db).find_by_feishu_table(app_token, table_id)
             if not project:
-                logger.warning("bitable project not found app_token=%s table_id=%s", app_token, table_id)
-                return
-
-            service = FeishuStoryboardService(db)
-            asyncio.run(service.sync_from_feishu(project))
-            response = asyncio.run(service.feishu.search_records(app_token, table_id, {}))
-            records = response.get("data", {}).get("items", [])
-            target = next((record for record in records if record.get("record_id") == record_id), None)
-            if target:
-                asyncio.run(service.process_record_status(project=project, record=target))
-                logger.info("bitable record processed project_id=%s record_id=%s", project.id, record_id)
+                debug_paper = DebugPaperFormService()
+                if asyncio.run(debug_paper.handles_table(app_token, table_id)):
+                    asyncio.run(
+                        debug_paper.process_record_by_table(
+                            app_token=app_token,
+                            table_id=table_id,
+                            record_id=record_id,
+                        )
+                    )
+                    logger.info(
+                        "bitable debug-paper record processed app_token=%s table_id=%s record_id=%s",
+                        app_token,
+                        table_id,
+                        record_id,
+                    )
+                else:
+                    video_downloads = VideoDownloadService()
+                    if asyncio.run(video_downloads.handles_table(app_token, table_id)):
+                        result = asyncio.run(
+                            video_downloads.process_record_by_table(
+                                app_token=app_token,
+                                table_id=table_id,
+                                record_id=record_id,
+                            )
+                        )
+                        logger.info(
+                            "bitable video-download record processed app_token=%s table_id=%s record_id=%s status=%s",
+                            app_token,
+                            table_id,
+                            record_id,
+                            result.status,
+                        )
+                    else:
+                        logger.warning("bitable project not found app_token=%s table_id=%s", app_token, table_id)
             else:
-                logger.info("bitable record missing after sync project_id=%s record_id=%s", project.id, record_id)
+                service = FeishuStoryboardService(db)
+                asyncio.run(service.sync_from_feishu(project))
+                response = asyncio.run(service.feishu.search_records(app_token, table_id, {}))
+                records = response.get("data", {}).get("items", [])
+                target = next((record for record in records if record.get("record_id") == record_id), None)
+                if target:
+                    asyncio.run(service.process_record_status(project=project, record=target))
+                    logger.info("bitable record processed project_id=%s record_id=%s", project.id, record_id)
+                else:
+                    logger.info("bitable record missing after sync project_id=%s record_id=%s", project.id, record_id)
         except Exception:
             logger.exception("bitable record handling failed record_id=%s", record_id)
         finally:

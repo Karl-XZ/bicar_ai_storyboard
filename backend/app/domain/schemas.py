@@ -62,7 +62,7 @@ class ShotCreate(BaseModel):
 class CreateProjectRequest(BaseModel):
     name: str
     aspect_ratio: str = "16:9"
-    duration_seconds: int = 5
+    duration_seconds: float = 5
     default_text_provider: str = Field(default_factory=lambda: settings.default_text_provider)
     default_text_model: str = Field(default_factory=_default_text_model)
     default_image_provider: str = Field(default_factory=lambda: settings.default_image_provider)

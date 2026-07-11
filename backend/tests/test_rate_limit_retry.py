@@ -68,6 +68,26 @@ class RateLimitedVideoProvider:
         }
 
 
+class XYQVipFlakyVideoProvider:
+    def __init__(self, failures: int) -> None:
+        self.failures = failures
+        self.create_calls = 0
+
+    async def create_video_task(self, payload: dict) -> VideoTaskResult:
+        self.create_calls += 1
+        if self.create_calls <= self.failures:
+            raise RuntimeError("小云雀 API 错误：ret=2, errmsg=非vip用户，无法使用该功能")
+        return VideoTaskResult(provider_task_id="video-task-xyq")
+
+    async def poll_video_task(self, provider_task_id: str) -> dict:
+        return {
+            "status": "succeeded",
+            "provider_task_id": provider_task_id,
+            "video_bytes": b"video-bytes",
+            "mime_type": "video/mp4",
+        }
+
+
 def test_prompt_rate_limit_retries_then_fails(monkeypatch):
     db = make_db()
     project = ProjectService(db).create_project(
@@ -193,6 +213,48 @@ def test_video_rate_limit_retries_then_succeeds(monkeypatch):
     assert sleeps == [300]
     assert logs and "小云雀/小云雀" in logs[0]
     assert "第1次回退重试" in logs[0]
+    assert shot.status == ShotStatus.PENDING_ACCEPTANCE.value
+    assert shot.error_code is None
+    assert shot.error_message is None
+
+
+def test_xyq_vip_message_retries_then_succeeds(monkeypatch):
+    db = make_db()
+    project = ProjectService(db).create_project(
+        CreateProjectRequest(
+            name="小云雀VIP波动项目",
+            default_text_provider="mock",
+            default_text_model="mock-text-v1",
+            default_video_provider="xyq_nest",
+            default_video_model="小云雀",
+            initial_shots=[ShotCreate(shot_no="001", scene_description="复古广告镜头")],
+        )
+    )
+    shot = ProjectService(db).list_shots(project.id)[0]
+    workflow = WorkflowService(db)
+    workflow.optimize_prompt(shot.id)
+    provider = XYQVipFlakyVideoProvider(failures=1)
+    logs: list[str] = []
+    sleeps: list[int] = []
+
+    async def fake_sleep(seconds: int) -> None:
+        sleeps.append(seconds)
+
+    async def fake_sync(target_shot) -> None:
+        logs.append(target_shot.error_message or "")
+        db.commit()
+
+    monkeypatch.setattr(workflow.provider_router, "video", lambda provider_name=None: provider)
+    monkeypatch.setattr("app.services.workflow.asyncio.sleep", fake_sleep)
+    monkeypatch.setattr(workflow, "_sync_shot_error_log", fake_sync)
+
+    job = workflow.generate_video(shot.id)
+
+    db.refresh(shot)
+    assert job.status == "succeeded"
+    assert sleeps == [300]
+    assert logs and "第1次回退重试" in logs[0]
+    assert "非vip用户" in logs[0]
     assert shot.status == ShotStatus.PENDING_ACCEPTANCE.value
     assert shot.error_code is None
     assert shot.error_message is None

@@ -1,4 +1,4 @@
-from app.adapters.feishu_fields import build_field_map, validate_required_fields
+from app.adapters.feishu_fields import bitable_field_definitions, build_field_map, validate_required_fields
 
 
 def test_validate_required_fields():
@@ -18,3 +18,18 @@ def test_validate_required_fields():
         }
     }
     assert validate_required_fields(build_field_map(response)) == []
+
+
+def test_reference_image_notes_field_is_available_as_text():
+    definitions = bitable_field_definitions()
+    field = next(item for item in definitions if item["field_name"] == "参考图批注")
+
+    assert field["type"] == 1
+
+
+def test_keyframe_time_and_video_duration_are_number_fields():
+    definitions = bitable_field_definitions()
+    by_name = {item["field_name"]: item for item in definitions}
+
+    assert by_name["关键帧时间点"]["type"] == 2
+    assert by_name["视频时长"]["type"] == 2

@@ -31,6 +31,8 @@ class FakeFeishuClient:
         self.sent_cards = []
         self.updated_records = []
         self.uploaded_files = []
+        self.moved_files = []
+        self.folder_items = {}
         self.fields = [
             {"field_name": "场景描述", "field_id": "fld_0"},
             {"field_name": "生成批次", "field_id": "fld_1"},
@@ -52,6 +54,8 @@ class FakeFeishuClient:
         return {"code": 0, "data": {"token": f"fld_{len(name)}_{len(parent_token)}", "url": f"https://feishu.test/{name}"}}
 
     async def list_folder_items(self, folder_token: str, *, page_size: int = 200, page_token: str | None = None) -> dict:
+        if folder_token in self.folder_items:
+            return {"code": 0, "data": {"files": self.folder_items[folder_token], "has_more": False}}
         if folder_token == "parent_folder":
             return {
                 "code": 0,
@@ -74,6 +78,14 @@ class FakeFeishuClient:
                 },
             }
         return {"code": 0, "data": {"files": [], "has_more": False}}
+
+    async def move_file(self, file_token: str, *, folder_token: str, file_type: str = "file") -> dict:
+        self.moved_files.append({"file_token": file_token, "folder_token": folder_token, "file_type": file_type})
+        for source_folder, items in list(self.folder_items.items()):
+            self.folder_items[source_folder] = [
+                item for item in items if str(item.get("token") or item.get("file_token") or "") != file_token
+            ]
+        return {"code": 0, "data": {"file_token": file_token}}
 
     async def create_bitable_app(self, name: str, folder_token: str = "") -> dict:
         return {"code": 0, "data": {"app": {"app_token": "app_001", "url": "https://feishu.test/base/app_001"}}}
@@ -162,6 +174,7 @@ def test_feishu_storyboard_real_user_flow(monkeypatch):
         assert fake.records[1]["fields"]["图片生成状态"] == "未开始"
         assert fake.records[1]["fields"]["生成状态"] == "未开始"
         assert fake.records[1]["fields"]["重新生成状态"] == "未开始"
+        assert fake.records[1]["fields"]["视频时长"] == 5.0
 
         optimized = await service.optimize_current_batch(project=provisioned.project, batch_no="batch_001")
         assert optimized[0].status == ShotStatus.PENDING_FRAMES.value
@@ -183,12 +196,20 @@ def test_feishu_storyboard_real_user_flow(monkeypatch):
         assert fake.records[0]["fields"]["审核状态"] == "通过"
         assert "视频链接" not in fake.records[0]["fields"]
 
+        folders = provisioned.project.workflow_config["folders"]
+        fake.folder_items[folders["videos"]] = [
+            {"name": "001_v000_old.mp4", "token": "old_video_token", "type": "file"},
+            {"name": "ARCHIVED", "token": folders["videos_archived"], "type": "folder"},
+        ]
         fake.records[0]["fields"]["生成状态"] = "启动"
         shot = await service.process_record_status(project=provisioned.project, record=fake.records[0])
         assert shot.status == ShotStatus.PENDING_ACCEPTANCE.value
         assert fake.records[0]["fields"]["审核状态"] == "通过"
         assert fake.records[0]["fields"]["生成状态"] == "生成完成"
         assert fake.records[0]["fields"]["视频链接"]["link"].startswith("https://feishu.test/file/")
+        assert fake.moved_files == [
+            {"file_token": "old_video_token", "folder_token": folders["videos_archived"], "file_type": "file"}
+        ]
 
         fake.records[0]["fields"]["满意度"] = "满意"
         shot = await service.process_record_status(project=provisioned.project, record=fake.records[0])
@@ -199,6 +220,44 @@ def test_feishu_storyboard_real_user_flow(monkeypatch):
         project = ProjectService(db).get_project(provisioned.project.id)
         stats = service.progress_stats(project)
         assert stats["archived"] == 1
+
+    asyncio.run(run_flow())
+
+
+def test_create_project_from_bot_without_chat_id_does_not_fallback_to_default_chat(monkeypatch):
+    import asyncio
+
+    async def run_flow():
+        monkeypatch.setattr(settings, "feishu_default_chat_id", "oc_default_group")
+        db = make_db()
+        fake = FakeFeishuClient()
+        service = FeishuStoryboardService(db, feishu=fake)
+
+        provisioned = await service.create_project_from_bot(project_name="无会话项目", chat_id=None)
+
+        assert provisioned.project.workflow_config["chat_id"] is None
+        assert fake.sent_cards == []
+
+    asyncio.run(run_flow())
+
+
+def test_send_progress_without_any_chat_id_does_not_fallback_to_default_chat(monkeypatch):
+    import asyncio
+
+    async def run_flow():
+        monkeypatch.setattr(settings, "feishu_default_chat_id", "oc_default_group")
+        db = make_db()
+        fake = FakeFeishuClient()
+        service = FeishuStoryboardService(db, feishu=fake)
+
+        provisioned = await service.create_project_from_bot(project_name="进度无会话项目", chat_id="oc_test")
+        provisioned.project.workflow_config = {**(provisioned.project.workflow_config or {}), "chat_id": None}
+        db.commit()
+        fake.sent_cards.clear()
+
+        await service.send_progress(provisioned.project, chat_id=None)
+
+        assert fake.sent_cards == []
 
     asyncio.run(run_flow())
 
@@ -473,6 +532,34 @@ def test_ensure_table_fields_deletes_legacy_shot_no_columns(monkeypatch):
 
         assert fake.deleted_fields == ["legacy_1", "legacy_2"]
         assert all(field["field_name"] != "镜号" for field in fake.fields)
+
+    asyncio.run(run_flow())
+
+
+def test_ensure_table_fields_skips_undeletable_primary_shot_no_column(monkeypatch):
+    import asyncio
+
+    async def run_flow():
+        monkeypatch.setattr(settings, "default_text_provider", "mock")
+        monkeypatch.setattr(settings, "default_image_provider", "mock")
+        monkeypatch.setattr(settings, "default_video_provider", "mock")
+        db = make_db()
+        fake = FakeFeishuClient()
+        fake.fields.append({"field_name": "镜号", "field_id": "primary_legacy"})
+
+        async def delete_field(app_token: str, table_id: str, field_id: str) -> dict:
+            if field_id == "primary_legacy":
+                raise FeishuApiError("Feishu API error: code=1254046, msg=The Primary Field cannot be deleted.", code=1254046)
+            return await FakeFeishuClient.delete_field(fake, app_token, table_id, field_id)
+
+        fake.delete_field = delete_field
+        service = FeishuStoryboardService(db, feishu=fake)
+        provisioned = await service.create_project_from_bot(project_name="主字段镜号兼容项目", chat_id="oc_test")
+
+        created = await service.ensure_table_fields(provisioned.project)
+
+        assert "关键帧时间点" in created or any(field["field_name"] == "关键帧时间点" for field in fake.fields)
+        assert any(field["field_name"] == "镜号" for field in fake.fields)
 
     asyncio.run(run_flow())
 

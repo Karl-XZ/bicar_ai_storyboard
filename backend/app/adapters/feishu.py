@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import mimetypes
 import re
+import zlib
 from urllib.parse import unquote
 from typing import Any
 
@@ -20,6 +21,9 @@ class FeishuApiError(RuntimeError):
 
 
 class FeishuClient:
+    _SIMPLE_UPLOAD_LIMIT = 20 * 1024 * 1024
+    _MULTIPART_CHUNK_SIZE = 4 * 1024 * 1024
+
     def __init__(self, auth: FeishuAuthClient | None = None, base_url: str | None = None) -> None:
         self.auth = auth or FeishuAuthClient()
         self.base_url = (base_url or settings.feishu_base_url).rstrip("/")
@@ -66,6 +70,12 @@ class FeishuClient:
             json={"table": {"name": table_name, "default_view_name": "全部分镜", "fields": fields}},
         )
 
+    async def list_tables(self, app_token: str) -> dict:
+        return await self._request(
+            "GET",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables",
+        )
+
     async def batch_create_records(self, app_token: str, table_id: str, records: list[dict]) -> dict:
         return await self._request(
             "POST",
@@ -87,13 +97,57 @@ class FeishuClient:
             json={"records": records},
         )
 
+    async def batch_delete_records(self, app_token: str, table_id: str, record_ids: list[str]) -> dict:
+        return await self._request(
+            "POST",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/records/batch_delete",
+            json={"records": record_ids},
+        )
+
     async def list_fields(self, app_token: str, table_id: str) -> dict:
         return await self._request("GET", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields")
+
+    async def list_views(self, app_token: str, table_id: str) -> dict:
+        return await self._request("GET", f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/views")
+
+    async def create_view(self, app_token: str, table_id: str, *, view_name: str, view_type: str) -> dict:
+        return await self._request(
+            "POST",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/views",
+            json={"view_name": view_name, "view_type": view_type},
+        )
+
+    async def update_form_metadata(self, app_token: str, table_id: str, form_id: str, payload: dict) -> dict:
+        return await self._request(
+            "PATCH",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/forms/{form_id}",
+            json=payload,
+        )
+
+    async def list_form_fields(self, app_token: str, table_id: str, form_id: str) -> dict:
+        return await self._request(
+            "GET",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/forms/{form_id}/fields",
+        )
+
+    async def update_form_field(self, app_token: str, table_id: str, form_id: str, field_id: str, payload: dict) -> dict:
+        return await self._request(
+            "PATCH",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/forms/{form_id}/fields/{field_id}",
+            json=payload,
+        )
 
     async def create_field(self, app_token: str, table_id: str, field: dict) -> dict:
         return await self._request(
             "POST",
             f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields",
+            json=field,
+        )
+
+    async def update_field(self, app_token: str, table_id: str, field_id: str, field: dict) -> dict:
+        return await self._request(
+            "PUT",
+            f"/open-apis/bitable/v1/apps/{app_token}/tables/{table_id}/fields/{field_id}",
             json=field,
         )
 
@@ -134,11 +188,40 @@ class FeishuClient:
             json={"type": file_type, "folder_token": folder_token},
         )
 
+    async def update_permission_public(self, token: str, *, file_type: str, payload: dict[str, Any]) -> dict:
+        return await self._request(
+            "PATCH",
+            f"/open-apis/drive/v1/permissions/{token}/public",
+            params={"type": file_type},
+            json=payload,
+        )
+
+    async def copy_file(self, file_token: str, *, folder_token: str, name: str, file_type: str = "file") -> dict:
+        return await self._request(
+            "POST",
+            f"/open-apis/drive/v1/files/{file_token}/copy",
+            json={"type": file_type, "folder_token": folder_token, "name": name},
+            timeout=120,
+        )
+
+    async def delete_file(self, file_token: str, *, file_type: str = "file") -> dict:
+        return await self._request(
+            "DELETE",
+            f"/open-apis/drive/v1/files/{file_token}",
+            params={"type": file_type},
+        )
+
     async def create_document(self, title: str) -> dict:
         return await self._request(
             "POST",
             "/open-apis/docx/v1/documents",
             json={"title": title},
+        )
+
+    async def get_document_metadata(self, document_id: str) -> dict:
+        return await self._request(
+            "GET",
+            f"/open-apis/docx/v1/documents/{document_id}",
         )
 
     async def get_document_raw_content(self, document_id: str) -> dict:
@@ -161,7 +244,44 @@ class FeishuClient:
             json={"children": children, "index": index},
         )
 
+    async def list_file_comments(
+        self,
+        file_token: str,
+        *,
+        file_type: str = "docx",
+        page_size: int = 100,
+        page_token: str | None = None,
+    ) -> dict:
+        params: dict[str, Any] = {"file_type": file_type, "page_size": page_size}
+        if page_token:
+            params["page_token"] = page_token
+        return await self._request(
+            "GET",
+            f"/open-apis/drive/v1/files/{file_token}/comments",
+            params=params,
+        )
+
+    async def add_file_comment_reply(
+        self,
+        file_token: str,
+        comment_id: str,
+        text: str,
+        *,
+        file_type: str = "docx",
+    ) -> dict:
+        return await self._request(
+            "POST",
+            f"/open-apis/drive/v1/files/{file_token}/comments/{comment_id}/replies",
+            params={"file_type": file_type},
+            json={"content": {"elements": [{"type": "text_run", "text_run": {"text": text}}]}},
+        )
+
     async def upload_file(self, folder_token: str, name: str, content: bytes) -> dict:
+        if len(content) > self._SIMPLE_UPLOAD_LIMIT:
+            return await self._upload_file_multipart(folder_token, name, content)
+        return await self._upload_file_small(folder_token, name, content)
+
+    async def _upload_file_small(self, folder_token: str, name: str, content: bytes) -> dict:
         token = await self.auth.get_tenant_access_token()
         files = {"file": (name, content)}
         data = {"parent_type": "explorer", "parent_node": folder_token, "file_name": name, "size": str(len(content))}
@@ -173,6 +293,85 @@ class FeishuClient:
                 files=files,
             )
         return self._decode_response(response)
+
+    async def _upload_file_multipart(self, folder_token: str, name: str, content: bytes) -> dict:
+        token = await self.auth.get_tenant_access_token()
+        block_num = max(1, (len(content) + self._MULTIPART_CHUNK_SIZE - 1) // self._MULTIPART_CHUNK_SIZE)
+        prepare_payload = {
+            "file_name": name,
+            "parent_type": "explorer",
+            "parent_node": folder_token,
+            "size": len(content),
+            "block_num": block_num,
+        }
+        try:
+            prepare_response = await self._request_with_token(
+                "POST",
+                "/open-apis/drive/v1/files/upload_prepare",
+                token=token,
+                json=prepare_payload,
+                timeout=60,
+            )
+        except FeishuApiError as exc:
+            if not self._is_invalid_access_token_error(exc):
+                raise
+            token = await self.auth.get_tenant_access_token(force_refresh=True)
+            prepare_response = await self._request_with_token(
+                "POST",
+                "/open-apis/drive/v1/files/upload_prepare",
+                token=token,
+                json=prepare_payload,
+                timeout=60,
+            )
+        upload_id = str((prepare_response.get("data") or {}).get("upload_id") or "")
+        if not upload_id:
+            raise FeishuApiError("Feishu multipart upload_prepare succeeded without upload_id", body=prepare_response)
+
+        async with httpx.AsyncClient(timeout=120) as client:
+            for seq, start in enumerate(range(0, len(content), self._MULTIPART_CHUNK_SIZE)):
+                chunk = content[start : start + self._MULTIPART_CHUNK_SIZE]
+                checksum = str(zlib.adler32(chunk) & 0xFFFFFFFF)
+                data = {
+                    "upload_id": upload_id,
+                    "seq": str(seq),
+                    "checksum": checksum,
+                    "size": str(len(chunk)),
+                }
+                for attempt in range(2):
+                    response = await client.post(
+                        f"{self.base_url}/open-apis/drive/v1/files/upload_part",
+                        headers={"Authorization": f"Bearer {token}"},
+                        data=data,
+                        files={"file": ("part", chunk, "application/octet-stream")},
+                    )
+                    try:
+                        self._decode_response(response)
+                        break
+                    except FeishuApiError as exc:
+                        if attempt or not self._is_invalid_access_token_error(exc):
+                            raise
+                        token = await self.auth.get_tenant_access_token(force_refresh=True)
+
+        finish_payload = {"upload_id": upload_id, "block_num": block_num}
+        try:
+            return await self._request_with_token(
+                "POST",
+                "/open-apis/drive/v1/files/upload_finish",
+                token=token,
+                json=finish_payload,
+                timeout=60,
+            )
+        except FeishuApiError as exc:
+            if not self._is_invalid_access_token_error(exc):
+                raise
+            token = await self.auth.get_tenant_access_token(force_refresh=True)
+            return await self._request_with_token(
+                "POST",
+                "/open-apis/drive/v1/files/upload_finish",
+                token=token,
+                json=finish_payload,
+                timeout=60,
+            )
 
     async def upload_bitable_attachment(self, app_token: str, name: str, content: bytes) -> dict:
         token = await self.auth.get_tenant_access_token()
@@ -233,6 +432,25 @@ class FeishuClient:
         timeout: float = 30,
     ) -> dict:
         token = await self.auth.get_tenant_access_token()
+        return await self._request_with_token(
+            method,
+            path,
+            token=token,
+            json=json,
+            params=params,
+            timeout=timeout,
+        )
+
+    async def _request_with_token(
+        self,
+        method: str,
+        path: str,
+        *,
+        token: str,
+        json: dict | None = None,
+        params: dict | None = None,
+        timeout: float = 30,
+    ) -> dict:
         async with httpx.AsyncClient(timeout=timeout) as client:
             response = await client.request(
                 method,
@@ -261,6 +479,10 @@ class FeishuClient:
                 body=body,
             )
         return body
+
+    def _is_invalid_access_token_error(self, exc: FeishuApiError) -> bool:
+        text = f"{exc} {exc.body}".lower()
+        return "invalid access token" in text or "token attached" in text
 
 
 def _filename_from_disposition(value: str) -> str | None:

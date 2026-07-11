@@ -10,6 +10,7 @@ class Settings(BaseSettings):
     app_env: str = "local"
     app_name: str = "biche-storyboard-api"
     app_debug: bool = True
+    app_public_base_url: str = "http://127.0.0.1:8000"
 
     database_url: str = "postgresql+psycopg://biche:biche@localhost:5432/biche_storyboard"
     redis_url: str = "redis://localhost:6379/0"
@@ -36,6 +37,9 @@ class Settings(BaseSettings):
     feishu_workspace_folder_name: str = "AI生成"
     feishu_workspace_storyboard_folder_name: str = "分镜项目"
     feishu_workspace_deep_research_folder_name: str = "Deep Research"
+    feishu_workspace_video_download_folder_name: str = "视频下载"
+    debug_paper_template_path: str = "local_storage/templates/调试纸CN.docx"
+    debug_paper_target_folder_url: str = ""
 
     openai_api_key: str = ""
     openai_base_url: str = "https://api.openai.com"
@@ -56,6 +60,7 @@ class Settings(BaseSettings):
     openrouter_deep_research_model: str = "openai/o4-mini-deep-research"
     openrouter_image_model: str = "openai/gpt-5.4-image-2"
     openrouter_nano_banana_model: str = "google/gemini-3.1-flash-image-preview"
+    video_storyboard_vision_model: str = "google/gemini-3.1-pro-preview"
 
     dashscope_api_key: str = ""
     dashscope_base_url: str = "https://dashscope.aliyuncs.com/api/v1"

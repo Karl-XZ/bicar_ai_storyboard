@@ -61,6 +61,127 @@ def test_latest_for_chat_does_not_fall_back_to_other_chat():
     assert ProjectService(db).latest_for_chat("oc_bound").id == project.id
 
 
+def test_active_project_binding_overrides_latest_project_for_chat():
+    db = make_db()
+    service = ProjectService(db)
+    older = service.create_project(CreateProjectRequest(name="旧项目"))
+    older.feishu_app_token = "app_old"
+    older.feishu_table_id = "tbl_old"
+    older.workflow_config = {**(older.workflow_config or {}), "chat_id": "oc_group"}
+
+    newer = service.create_project(CreateProjectRequest(name="新项目"))
+    newer.feishu_app_token = "app_new"
+    newer.feishu_table_id = "tbl_new"
+    newer.workflow_config = {**(newer.workflow_config or {}), "chat_id": "oc_group"}
+    db.commit()
+
+    prefs = ChatPreferenceService(db)
+    prefs.set_active_project_id(chat_id="oc_group", chat_type="group", sender_open_id="ou_alice", project_id=str(older.id))
+    db.commit()
+
+    current = bot_commands._current_chat_project(
+        db,
+        chat_id="oc_group",
+        chat_type="group",
+        sender_open_id="ou_alice",
+    )
+
+    assert current is not None
+    assert current.id == older.id
+
+
+def test_message_with_bitable_link_rebinds_active_project():
+    db = make_db()
+    service = ProjectService(db)
+    older = service.create_project(CreateProjectRequest(name="旧项目"))
+    older.feishu_app_token = "app_old"
+    older.feishu_table_id = "tbl_old"
+    older.workflow_config = {**(older.workflow_config or {}), "chat_id": "oc_group"}
+
+    newer = service.create_project(CreateProjectRequest(name="新项目"))
+    newer.feishu_app_token = "app_new"
+    newer.feishu_table_id = "tbl_new"
+    newer.workflow_config = {**(newer.workflow_config or {}), "chat_id": "oc_group"}
+    db.commit()
+
+    prefs = ChatPreferenceService(db)
+    prefs.set_active_project_id(chat_id="oc_group", chat_type="group", sender_open_id="ou_alice", project_id=str(newer.id))
+    db.commit()
+
+    rebound = bot_commands._maybe_bind_project_from_message(
+        db,
+        text="6450 分镜表在这里：https://ocnwptzvwvt6.feishu.cn/base/app_old?table=tbl_old",
+        chat_id="oc_group",
+        chat_type="group",
+        sender_open_id="ou_alice",
+        preferences=prefs,
+    )
+
+    assert rebound is not None
+    assert rebound.id == older.id
+    assert (
+        prefs.get_active_project_id(
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+        )
+        == str(older.id)
+    )
+
+
+def test_switch_current_project_command_rebinds_current_session(monkeypatch):
+    db = make_db()
+    service = ProjectService(db)
+    older = service.create_project(CreateProjectRequest(name="旧项目"))
+    older.feishu_app_token = "app_old"
+    older.feishu_table_id = "tbl_old"
+    older.feishu_folder_token = "fld_old"
+    older.workflow_config = {**(older.workflow_config or {}), "chat_id": "oc_group"}
+
+    newer = service.create_project(CreateProjectRequest(name="新项目"))
+    newer.feishu_app_token = "app_new"
+    newer.feishu_table_id = "tbl_new"
+    newer.feishu_folder_token = "fld_new"
+    newer.workflow_config = {**(newer.workflow_config or {}), "chat_id": "oc_group"}
+    db.commit()
+
+    prefs = ChatPreferenceService(db)
+    prefs.set_active_project_id(chat_id="oc_group", chat_type="group", sender_open_id="ou_alice", project_id=str(newer.id))
+    db.commit()
+
+    sent: dict[str, str] = {}
+
+    class FakeFeishuClient:
+        async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> dict:
+            sent["receive_id"] = receive_id
+            sent["text"] = text
+            return {"ok": True}
+
+    monkeypatch.setattr(bot_commands, "FeishuClient", FakeFeishuClient)
+
+    result = asyncio.run(
+        bot_commands.handle_bot_text(
+            db,
+            text="/切换当前项目 https://ocnwptzvwvt6.feishu.cn/base/app_old?table=tbl_old",
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+        )
+    )
+
+    assert result["message"] == "当前项目已切换"
+    assert "当前会话已切换到项目：`旧项目`" in sent["text"]
+    assert "https://feishu.cn/base/app_old?table=tbl_old" in sent["text"]
+    assert (
+        prefs.get_active_project_id(
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+        )
+        == str(older.id)
+    )
+
+
 def test_chatbot_reply_uses_history_and_persists_turn(monkeypatch):
     db = make_db()
     history = ChatMemoryService(db, chat_id="oc_group", chat_type="group", sender_open_id="ou_alice")
@@ -148,6 +269,41 @@ def test_handle_bot_text_sends_normal_chat_as_markdown_card(monkeypatch):
     assert sent["card"]["elements"][0]["tag"] == "markdown"
     assert "**回复重点**" in sent["card"]["elements"][0]["content"]
     assert sent["card"]["elements"][1]["actions"][0]["text"]["content"] == "/Agent"
+
+
+def test_handle_bot_text_never_falls_back_to_default_chat(monkeypatch):
+    db = make_db()
+    sent_calls: list[tuple[str, str]] = []
+
+    monkeypatch.setattr(settings, "feishu_default_chat_id", "oc_default_group")
+
+    class FakeFeishuClient:
+        async def send_card(self, receive_id: str, card: dict, receive_id_type: str = "chat_id") -> dict:
+            sent_calls.append(("card", receive_id))
+            return {"ok": True}
+
+        async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> dict:
+            sent_calls.append(("text", receive_id))
+            return {"ok": True}
+
+    async def fake_chatbot_reply(*args, **kwargs) -> str:
+        return "不应该回退到默认群。"
+
+    monkeypatch.setattr(bot_commands, "FeishuClient", FakeFeishuClient)
+    monkeypatch.setattr(bot_commands, "_chatbot_reply", fake_chatbot_reply)
+
+    result = asyncio.run(
+        bot_commands.handle_bot_text(
+            db,
+            text="测试不要回退默认群",
+            chat_id=None,
+            chat_type="p2p",
+            sender_open_id="ou_alice",
+        )
+    )
+
+    assert result == {"message": "chatbot 已回复", "data": {"chat_id": None}}
+    assert sent_calls == []
 
 
 def test_handle_bot_text_streams_long_reply_in_multiple_cards(monkeypatch):
@@ -399,7 +555,8 @@ def test_agent_reply_uses_deepseek_runtime_when_selected(monkeypatch):
     )
 
     assert reply == "deepseek agent reply"
-    assert captured["message"] == "请总结"
+    assert "请总结" in captured["message"]
+    assert "文档/文案修订规则（强约束）" in captured["message"]
     assert captured["model"] == "deepseek/deepseek-v4-pro"
     assert reactions == [("add", "om_msg_001"), ("remove", "om_msg_001")]
 
@@ -933,7 +1090,8 @@ def test_openclaw_agent_existing_session_does_not_duplicate_memory(monkeypatch, 
     )
 
     assert reply == "ok"
-    assert captured["message"] == "继续"
+    assert captured["message"].endswith("继续")
+    assert "文档/文案修订规则（强约束）" in captured["message"]
 
 
 def test_agent_upload_request_uses_recent_local_artifact_and_returns_feishu_link(monkeypatch, tmp_path):
@@ -1030,6 +1188,76 @@ def test_extract_openclaw_agent_reply_falls_back_to_payload_text():
     }
 
     assert bot_commands._extract_openclaw_agent_reply(payload) == "第一段 payload 文本"
+
+
+def test_extract_openclaw_agent_reply_returns_chinese_fallback_when_success_has_no_text():
+    payload = {
+        "status": "success",
+        "result": {
+            "toolMetas": [{"toolName": "exec", "meta": "did something"}],
+        },
+        "messages": [
+            {"role": "assistant", "content": [{"type": "thinking", "thinking": "done"}]},
+        ],
+    }
+
+    reply = bot_commands._extract_openclaw_agent_reply(payload)
+
+    assert "系统兜底收尾" in reply
+    assert "联系开发者" in reply
+
+
+def test_extract_openclaw_agent_reply_reports_timeout_fallback():
+    payload = {
+        "status": "success",
+        "result": {
+            "finalStatus": "error",
+            "timedOut": True,
+            "timedOutDuringToolExecution": True,
+            "promptError": "request timed out | request timed out",
+            "assistantTexts": [],
+        },
+        "messages": [
+            {"role": "assistant", "content": []},
+        ],
+    }
+
+    reply = bot_commands._extract_openclaw_agent_reply(payload)
+
+    assert "系统兜底收尾" in reply
+    assert "超时" in reply
+    assert "request timed out" in reply
+    assert "联系开发者" in reply
+
+
+def test_extract_openclaw_agent_reply_reports_rate_limit_fallback():
+    payload = {
+        "result": {
+            "finalStatus": "error",
+            "error": "OpenRouter HTTP 429: rate limit exceeded",
+            "assistantTexts": [],
+        }
+    }
+
+    reply = bot_commands._extract_openclaw_agent_reply(payload)
+
+    assert "系统兜底收尾" in reply
+    assert "限流" in reply
+    assert "429" in reply
+
+
+def test_resolve_openclaw_command_prefers_bundled_runtime(monkeypatch, tmp_path):
+    bundled_node = tmp_path / "node"
+    bundled_entry = tmp_path / "index.js"
+    bundled_node.write_text("")
+    bundled_entry.write_text("")
+    monkeypatch.setattr(bot_commands, "_OPENCLAW_BUNDLED_NODE", bundled_node)
+    monkeypatch.setattr(bot_commands, "_OPENCLAW_BUNDLED_ENTRYPOINT", bundled_entry)
+    monkeypatch.setattr(bot_commands.shutil, "which", lambda _: "/usr/local/bin/openclaw")
+
+    command = bot_commands._resolve_openclaw_command()
+
+    assert command == [str(bundled_node), str(bundled_entry)]
 
 
 def test_new_session_only_bumps_current_agent_nonce(monkeypatch):
@@ -1824,3 +2052,177 @@ def test_chatbot_reply_injects_search_context_for_deepseek(monkeypatch):
     assert captured["query"] == "帮我查一下 e.go 公司最新公开资料"
     assert captured["model"] == "deepseek-v4-pro"
     assert captured["messages"][-1]["content"] == "搜索结果：example.com"
+
+
+def test_handle_bot_text_intercepts_query_progress_even_in_agent_mode(monkeypatch):
+    db = make_db()
+    project = ProjectService(db).create_project(CreateProjectRequest(name="进度项目"))
+    project.feishu_app_token = "app_123"
+    project.feishu_table_id = "tbl_123"
+    project.feishu_folder_token = "fld_123"
+    project.workflow_config = {**(project.workflow_config or {}), "chat_id": "oc_group"}
+    db.commit()
+
+    ChatPreferenceService(db).set_assistant_mode(
+        chat_id="oc_group",
+        chat_type="group",
+        sender_open_id="ou_alice",
+        mode=bot_commands.ASSISTANT_MODE_AGENT,
+    )
+    db.commit()
+
+    sent_cards: list[dict] = []
+
+    class FakeFeishuClient:
+        async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> dict:
+            return {"ok": True}
+
+        async def send_card(self, receive_id: str, card: dict, receive_id_type: str = "chat_id") -> dict:
+            sent_cards.append(card)
+            return {"ok": True}
+
+        async def add_message_reaction(self, message_id: str, emoji_type: str) -> dict:
+            return {"data": {"reaction_id": "reaction_1"}}
+
+        async def remove_message_reaction(self, message_id: str, reaction_id: str) -> dict:
+            return {"ok": True}
+
+    monkeypatch.setattr(bot_commands, "FeishuClient", FakeFeishuClient)
+    async def fake_run_openclaw_agent(*, session_id, message, timeout_seconds=600, session_key=None, model=None):
+        assert "当前聊天绑定的项目上下文" in message
+        assert "这是默认候选项目，不是唯一真相" in message
+        assert "表格链接：" in message
+        assert "不确定时先明确追问" in message
+        return {"result": {"finalAssistantVisibleText": "Agent 已看到项目链接"}}
+    monkeypatch.setattr(bot_commands, "_run_openclaw_agent", fake_run_openclaw_agent)
+
+    result = asyncio.run(
+        bot_commands.handle_bot_text(
+            db,
+            text="查询进度",
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+        )
+    )
+
+    assert result["message"] == "chatbot 已回复"
+    assert sent_cards
+    assert sent_cards[-1]["elements"][0]["content"] == "Agent 已看到项目链接"
+
+
+def test_openclaw_agent_message_includes_project_links(monkeypatch):
+    db = make_db()
+    project = ProjectService(db).create_project(CreateProjectRequest(name="进度项目"))
+    project.feishu_app_token = "app_123"
+    project.feishu_table_id = "tbl_123"
+    project.feishu_folder_token = "fld_123"
+    project.workflow_config = {**(project.workflow_config or {}), "chat_id": "oc_group"}
+    db.commit()
+
+    ChatPreferenceService(db).set_assistant_mode(
+        chat_id="oc_group",
+        chat_type="group",
+        sender_open_id="ou_alice",
+        mode=bot_commands.ASSISTANT_MODE_AGENT,
+    )
+    db.commit()
+
+    captured: dict[str, str] = {}
+
+    sent_cards: list[dict] = []
+
+    class FakeFeishuClient:
+        async def send_text(self, receive_id: str, text: str, receive_id_type: str = "chat_id") -> dict:
+            return {"ok": True}
+
+        async def send_card(self, receive_id: str, card: dict, receive_id_type: str = "chat_id") -> dict:
+            sent_cards.append(card)
+            return {"ok": True}
+
+        async def add_message_reaction(self, message_id: str, emoji_type: str) -> dict:
+            return {"data": {"reaction_id": "reaction_1"}}
+
+        async def remove_message_reaction(self, message_id: str, reaction_id: str) -> dict:
+            return {"ok": True}
+
+    async def fake_run_openclaw_agent(*, session_id, message, timeout_seconds=600, session_key=None, model=None):
+        captured["openclaw_message"] = message
+        return {"result": {"finalAssistantVisibleText": "Agent 已看到项目链接"}}
+
+    monkeypatch.setattr(bot_commands, "FeishuClient", FakeFeishuClient)
+    monkeypatch.setattr(bot_commands, "_run_openclaw_agent", fake_run_openclaw_agent)
+
+    result = asyncio.run(
+        bot_commands.handle_bot_text(
+            db,
+            text="查询进度",
+            chat_id="oc_group",
+            chat_type="group",
+            sender_open_id="ou_alice",
+        )
+    )
+
+    assert result["message"] == "chatbot 已回复"
+    openclaw_message = captured["openclaw_message"]
+    assert "当前聊天绑定的项目上下文" in openclaw_message
+    assert "这是默认候选项目，不是唯一真相" in openclaw_message
+    assert "表格链接：" in openclaw_message
+    assert "不确定时先明确追问" in openclaw_message
+    assert "https://open.feishu.cn" not in openclaw_message
+    assert "https://" in openclaw_message
+    assert sent_cards[-1]["elements"][0]["content"] == "Agent 已看到项目链接"
+
+
+def test_openclaw_agent_message_includes_document_revision_policy():
+    db = make_db()
+    memory = ChatMemoryService(db, chat_id="oc_group", chat_type="group", sender_open_id="ou_alice")
+    memory.append_turn(
+        user_text="帮我改这份文案",
+        assistant_text="收到，先看现有版本。",
+    )
+    db.commit()
+
+    message = bot_commands._compose_openclaw_agent_message(
+        session_id="session_without_file",
+        memory=memory,
+        text="请把第 2 段改得更顺一点",
+    )
+
+    assert "文档/文案修订规则（强约束）" in message
+    assert "保留原文并加删除线" in message
+    assert "用黄色高亮标出新增内容" in message
+    assert "如果目标文档已经存在明显修订痕迹" in message
+    assert "当前新请求：请把第 2 段改得更顺一点" in message
+
+
+def test_openclaw_agent_message_includes_video_download_workflow_policy():
+    db = make_db()
+    memory = ChatMemoryService(db, chat_id="oc_group", chat_type="group", sender_open_id="ou_alice")
+
+    message = bot_commands._compose_openclaw_agent_message(
+        session_id="session_without_file",
+        memory=memory,
+        text="把这个文档划线评论里的 YouTube 视频都下载下来",
+    )
+
+    assert "视频下载工作流（Agent 强约束）" in message
+    assert "不要自己直接运行 `yt-dlp`" in message
+    assert "VideoDownloadService" in message
+    assert "AI生成/视频下载" in message
+    assert "非文档视频下载" in message
+    assert "目标文件夹" in message
+    assert "来源文档：<文档原名> <文档链接>" in message
+    assert "不得只写 `文档批注引用`" in message
+    assert "/open-apis/drive/v1/files/{doc_token}/comments" in message
+    assert "docs_link.url" in message
+    assert "preview_comment_id" in message
+
+
+def test_deepseek_agent_prompt_includes_revision_mode_rules():
+    prompt = bot_commands._agent_deepseek_system_prompt(session_type="private")
+
+    assert "默认采用修订模式" in prompt
+    assert "保留原文并加删除线" in prompt
+    assert "黄色高亮" in prompt
+    assert "不要继续直接改写；先在聊天里输出一个简短修改计划" in prompt

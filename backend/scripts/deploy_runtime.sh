@@ -18,11 +18,14 @@ mkdir -p "$RUNTIME_BACKEND/logs"
 
 launchctl bootout "gui/${UID_NUM}" "$API_PLIST" >/dev/null 2>&1 || true
 launchctl bootout "gui/${UID_NUM}" "$WS_PLIST" >/dev/null 2>&1 || true
+cd "$RUNTIME_BACKEND"
+./.venv311/bin/alembic upgrade head
 launchctl bootstrap "gui/${UID_NUM}" "$API_PLIST"
 launchctl bootstrap "gui/${UID_NUM}" "$WS_PLIST"
 launchctl enable "gui/${UID_NUM}/com.bicar.storyboard.api"
 launchctl enable "gui/${UID_NUM}/com.bicar.storyboard.feishu_ws"
 launchctl kickstart -k "gui/${UID_NUM}/com.bicar.storyboard.api"
 launchctl kickstart -k "gui/${UID_NUM}/com.bicar.storyboard.feishu_ws"
+./.venv311/bin/python scripts/self_check_runtime.py
 
-echo "Runtime deployed and services restarted."
+echo "Runtime deployed, services restarted, and self-check passed."

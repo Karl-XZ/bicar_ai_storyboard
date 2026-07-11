@@ -134,7 +134,7 @@ class DashScopeVideoProvider(VideoProvider):
         }
         duration = payload.get("duration_seconds")
         if duration and "wanx2.1-i2v-turbo" in model:
-            body["parameters"]["duration"] = int(duration)
+            body["parameters"]["duration"] = int(float(duration))
         return await _post_async_task(path=endpoint, api_key=api_key, body=body)
 
     async def poll_video_task(self, provider_task_id: str) -> dict:

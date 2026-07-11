@@ -13,6 +13,7 @@ from pathlib import Path
 from typing import Any, Awaitable, Callable
 from urllib.parse import parse_qs, unquote, urlparse
 import time
+from uuid import UUID
 
 import httpx
 from sqlalchemy.orm import Session
@@ -26,7 +27,16 @@ from app.services.chat_memory import ChatMemoryService, resolve_chat_session
 from app.services.chat_preferences import ChatPreferenceService
 from app.services.feishu_storyboard import FeishuStoryboardService
 from app.services.feishu_workspace import FeishuWorkspaceService
+from app.services.debug_paper_form import DebugPaperFormService, DebugPaperWorkspace
 from app.services.projects import ProjectService
+from app.services.video_downloads import (
+    DOWNLOAD_STATUS_DONE,
+    DOWNLOAD_STATUS_FAILED,
+    DOWNLOAD_STATUS_RUNNING,
+    VideoDownloadResult,
+    VideoDownloadService,
+)
+from app.services.video_storyboard import VideoStoryboardError, VideoStoryboardService
 from app.services.workflow import WorkflowService
 from app.providers.router import ProviderRouter
 
@@ -61,6 +71,7 @@ DIRECT_FIELD_ALIASES = {
     "negative_prompt": {"负面提示词", "negative_prompt", "negative"},
     "size": {"尺寸", "size"},
     "duration_seconds": {"时长", "duration", "duration_seconds"},
+    "keyframe_time_seconds": {"关键帧时间点", "关键帧时间", "keyframe_time", "keyframe_time_seconds"},
     "reference_images": {"参考图", "图片", "文件", "文件地址", "飞书地址", "reference", "reference_images"},
     "first_frame": {"首帧", "first_frame"},
     "last_frame": {"尾帧", "last_frame"},
@@ -78,11 +89,21 @@ class DirectGenerationCommand:
     prompt: str
     negative_prompt: str = ""
     size: str | None = None
-    duration_seconds: int | None = None
+    duration_seconds: float | None = None
+    keyframe_time_seconds: float | None = None
     reference_images: tuple[str, ...] = ()
     first_frame: tuple[str, ...] = ()
     last_frame: tuple[str, ...] = ()
     keyframes: tuple[str, ...] = ()
+
+
+@dataclass(frozen=True)
+class VideoStoryboardCommand:
+    video_reference: str
+    project_name: str | None = None
+    parent_folder_url: str | None = None
+    sample_count: int = 10
+    target_shots: int | None = None
 
 
 @dataclass(frozen=True)
@@ -112,6 +133,8 @@ class StaleChatRequest(RuntimeError):
 _ACTIVE_CHAT_REQUESTS: dict[str, int] = {}
 _ACTIVE_OPENCLAW_PROCESSES: dict[str, asyncio.subprocess.Process] = {}
 _RECENT_MODE_SWITCHES: dict[str, tuple[str, float]] = {}
+_OPENCLAW_BUNDLED_NODE = Path("/Users/applemima111/.openclaw/tools/node-v22.22.0/bin/node")
+_OPENCLAW_BUNDLED_ENTRYPOINT = Path("/Users/applemima111/.openclaw/tools/node-v22.22.0/lib/node_modules/openclaw/dist/index.js")
 
 AGENT_RUNTIME_CODEX = "codex"
 AGENT_RUNTIME_DEEPSEEK = "deepseek"
@@ -173,6 +196,15 @@ def _assert_request_current(request_context: ChatRequestContext | None) -> None:
         raise StaleChatRequest("stale chat request")
 
 
+def _resolve_openclaw_command() -> list[str]:
+    if _OPENCLAW_BUNDLED_NODE.exists() and _OPENCLAW_BUNDLED_ENTRYPOINT.exists():
+        return [str(_OPENCLAW_BUNDLED_NODE), str(_OPENCLAW_BUNDLED_ENTRYPOINT)]
+    binary = shutil.which("openclaw")
+    if binary:
+        return [binary]
+    raise RuntimeError("OpenClaw 未安装或不在 PATH 中。")
+
+
 async def handle_bot_text(
     db: Session,
     *,
@@ -182,9 +214,51 @@ async def handle_bot_text(
     sender_open_id: str | None = None,
     source_message_id: str | None = None,
 ) -> dict[str, Any] | None:
-    target_chat = chat_id or settings.feishu_default_chat_id
+    target_chat = chat_id
     session_chat_id = chat_id
     feishu = FeishuClient()
+    preferences = ChatPreferenceService(db)
+    _maybe_bind_project_from_message(
+        db,
+        text=text,
+        chat_id=session_chat_id,
+        chat_type=chat_type,
+        sender_open_id=sender_open_id,
+        preferences=preferences,
+    )
+    command_text = _command_text(text)
+    current_mode = preferences.get_assistant_mode(
+        chat_id=session_chat_id,
+        chat_type=chat_type,
+        sender_open_id=sender_open_id,
+    )
+
+    natural_project_command = _parse_natural_project_query_command(command_text) if current_mode != ASSISTANT_MODE_AGENT else None
+    if natural_project_command:
+        project = _current_chat_project(
+            db,
+            chat_id=target_chat,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+            preferences=preferences,
+        )
+        if not project:
+            if target_chat:
+                await feishu.send_text(target_chat, "还没有可操作的分镜项目，请先发送：新建分镜项目：项目名")
+            return {"message": "项目不存在", "data": {"command": natural_project_command["action"]}}
+        result = await handle_card_action(
+            db,
+            value={
+                "action": natural_project_command["action"],
+                "project_id": str(project.id),
+                "batch_no": natural_project_command["batch_no"],
+                **({"enabled": natural_project_command["enabled"] == "true"} if "enabled" in natural_project_command else {}),
+            },
+            chat_id=target_chat,
+        )
+        if target_chat:
+            await feishu.send_text(target_chat, result["message"])
+        return result
 
     if not _is_slash_command(text):
         if not str(text or "").strip():
@@ -201,11 +275,6 @@ async def handle_bot_text(
             if target_chat and message and _is_request_current(request_context):
                 await feishu.send_text(target_chat, message)
 
-        current_mode = ChatPreferenceService(db).get_assistant_mode(
-            chat_id=session_chat_id,
-            chat_type=chat_type,
-            sender_open_id=sender_open_id,
-        )
         try:
             reply = await _reply_with_timeout_hint(
                 db,
@@ -238,11 +307,31 @@ async def handle_bot_text(
             )
         return {"message": "chatbot 已回复", "data": {"chat_id": target_chat}}
 
-    command_text = _command_text(text)
     if _is_help_command(command_text):
         if target_chat:
             await feishu.send_card(target_chat, help_card())
         return {"message": "帮助已发送", "data": {"chat_id": target_chat}}
+
+    if _is_debug_paper_qr_command(command_text):
+        try:
+            workspace = await DebugPaperFormService().ensure_workspace()
+            reply = _debug_paper_qr_reply(workspace)
+        except Exception as exc:
+            reply = "\n".join(
+                [
+                    "调试纸飞书表单入口创建失败。",
+                    "",
+                    f"原因：`{type(exc).__name__}: {exc}`",
+                    "",
+                    "这一步需要飞书应用具备云文档/多维表格/文件夹相关权限。权限补齐后再次发送 `/调试纸二维码` 即可重试。",
+                ]
+            )
+        if target_chat:
+            await feishu.send_card(
+                target_chat,
+                chatbot_reply_card(content=reply, chat_id=target_chat, chat_type=chat_type, sender_open_id=sender_open_id),
+            )
+        return {"message": "调试纸二维码入口已发送", "data": {"chat_id": target_chat}}
 
     if _is_new_session_command(command_text):
         _invalidate_chat_session(
@@ -398,6 +487,80 @@ async def handle_bot_text(
             command=direct_command,
         )
 
+    video_storyboard_command = _parse_video_storyboard_command(command_text)
+    if video_storyboard_command:
+        async def progress_notifier(message: str) -> None:
+            if target_chat and message:
+                await feishu.send_text(target_chat, message)
+
+        try:
+            result = await VideoStoryboardService(db, feishu=feishu).create_project_from_video(
+                video_reference=video_storyboard_command.video_reference,
+                project_name=video_storyboard_command.project_name,
+                chat_id=target_chat,
+                parent_folder_url=video_storyboard_command.parent_folder_url,
+                sample_count=video_storyboard_command.sample_count,
+                target_shots=video_storyboard_command.target_shots,
+                progress_notifier=progress_notifier,
+            )
+        except VideoStoryboardError as exc:
+            if target_chat:
+                await feishu.send_text(target_chat, f"视频拆分镜失败：{exc}")
+            return {"message": "视频拆分镜失败", "data": {"error": str(exc)}}
+        except Exception as exc:
+            if target_chat:
+                await feishu.send_text(target_chat, f"视频拆分镜失败：{type(exc).__name__}: {exc}")
+            return {"message": "视频拆分镜失败", "data": {"error": str(exc), "type": type(exc).__name__}}
+        preferences.set_active_project_id(
+            chat_id=session_chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+            project_id=str(result.project.id),
+        )
+        db.commit()
+        reply = "\n".join(
+            [
+                "视频拆分镜完成，已创建可编辑分镜项目。",
+                f"- 项目：`{result.project.name}`",
+                f"- 源视频：`{result.source_filename}`",
+                f"- 抽帧数：{result.frame_count}",
+                f"- 分镜行数：{result.shot_count}",
+                f"- 视觉模型：`{result.vision_model}`",
+                f"- 表格链接：{result.table_url or '未返回'}",
+                f"- 项目文件夹：{result.folder_url or '未返回'}",
+                "",
+                "我没有自动启动图片或视频生成。请先检查表格内容，确认后再用 `/生成全部图片` 或表格状态启动生成。",
+            ]
+        )
+        if target_chat:
+            await feishu.send_card(
+                target_chat,
+                chatbot_reply_card(content=reply, chat_id=target_chat, chat_type=chat_type, sender_open_id=sender_open_id),
+            )
+        return {"message": "视频拆分镜完成", "data": {"project_id": str(result.project.id), "table_url": result.table_url}}
+
+    video_download_command = _parse_video_download_command(command_text)
+    if video_download_command is not None:
+        service = VideoDownloadService()
+        request = service.parse_request_from_conversation(
+            video_download_command,
+            recent_texts=[],
+            source_session=_session_source_label(chat_id=session_chat_id, chat_type=chat_type, sender_open_id=sender_open_id),
+        )
+        if not request:
+            if target_chat:
+                await feishu.send_text(target_chat, "请在命令后附上可下载的视频链接，例如：`/下载视频 https://...`，也可以顺手写上命名要求。")
+            return {"message": "视频下载命令缺少有效链接", "data": {}}
+        workspace = await service.ensure_workspace()
+        result = await service.create_chat_download_task_in_workspace(workspace=workspace, request=request)
+        reply = _video_download_reply(workspace=workspace, result=result)
+        if target_chat:
+            await feishu.send_card(
+                target_chat,
+                chatbot_reply_card(content=reply, chat_id=target_chat, chat_type=chat_type, sender_open_id=sender_open_id),
+            )
+        return {"message": "视频下载工作流已触发", "data": {"status": result.status, "record_id": result.record_id}}
+
     switch_model = _parse_chatbot_model_command(command_text)
     if switch_model:
         ChatPreferenceService(db).set_chatbot_text_model(
@@ -410,6 +573,35 @@ async def handle_bot_text(
         if target_chat:
             await feishu.send_text(target_chat, f"chatbot 文本模型已切换为：{switch_model}")
         return {"message": "chatbot 模型已切换", "data": {"model": switch_model}}
+
+    switch_project_text = _parse_switch_current_project_command(command_text)
+    if switch_project_text is not None:
+        project = _find_project_from_message_links(db, switch_project_text)
+        if not project:
+            message = "没有从这条命令里识别到可绑定的分镜表链接，或该链接还没有对应到已知项目。请发送：`/切换当前项目 <表格链接>`。"
+            if target_chat:
+                await feishu.send_text(target_chat, message)
+            return {"message": "切换当前项目失败", "data": {"reason": "project_not_found"}}
+        preferences.set_active_project_id(
+            chat_id=session_chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+            project_id=str(project.id),
+        )
+        db.commit()
+        storyboard = FeishuStoryboardService(db)
+        table_url = storyboard._project_table_url(project) or "未配置"
+        folder_url = storyboard._project_folder_url(project) or "未配置"
+        confirmation = "\n".join(
+            [
+                f"当前会话已切换到项目：`{project.name}`",
+                f"- 表格链接：{table_url}",
+                f"- 项目文件夹链接：{folder_url}",
+            ]
+        )
+        if target_chat:
+            await feishu.send_text(target_chat, confirmation)
+        return {"message": "当前项目已切换", "data": {"project_id": str(project.id)}}
 
     agent_runtime = _parse_agent_runtime_command(command_text)
     if agent_runtime:
@@ -446,6 +638,13 @@ async def handle_bot_text(
             chat_id=target_chat,
             parent_folder_url=folder_url,
         )
+        preferences.set_active_project_id(
+            chat_id=session_chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+            project_id=str(provisioned.project.id),
+        )
+        db.commit()
         return {
             "message": "项目已创建",
             "data": {"project_id": str(provisioned.project.id), "table_url": provisioned.table_url},
@@ -453,7 +652,13 @@ async def handle_bot_text(
 
     command = _parse_project_command(command_text)
     if command:
-        project = ProjectService(db).latest_for_chat(target_chat)
+        project = _current_chat_project(
+            db,
+            chat_id=target_chat,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+            preferences=preferences,
+        )
         if not project:
             if target_chat:
                 await feishu.send_text(target_chat, "还没有可操作的分镜项目，请先发送：新建分镜项目：项目名")
@@ -582,6 +787,13 @@ async def handle_card_action(db: Session, *, value: dict[str, Any], chat_id: str
     project = ProjectService(db).get_project(project_id)
     if not project:
         return {"message": "项目不存在", "data": {"project_id": project_id}}
+    ChatPreferenceService(db).set_active_project_id(
+        chat_id=resolved_chat_id,
+        chat_type=chat_type,
+        sender_open_id=sender_open_id,
+        project_id=str(project.id),
+    )
+    db.commit()
 
     if action == "batch.generate_frames":
         shots = await service.generate_current_batch(project=project, batch_no=batch_no)
@@ -694,6 +906,35 @@ def _is_new_session_command(text: str) -> bool:
 def _is_stop_command(text: str) -> bool:
     normalized = _normalize_command_phrase(text)
     return normalized in {"stop", "停止", "停止当前任务", "停止当前agent任务", "停止当前智能体任务", "取消", "取消当前任务"}
+
+
+def _is_debug_paper_qr_command(text: str) -> bool:
+    normalized = _normalize_command_phrase(text)
+    return normalized in {
+        "调试纸二维码",
+        "调试纸复制二维码",
+        "创建调试纸二维码",
+        "二维码创建调试纸",
+        "二维码复制调试纸",
+        "debug paper qr",
+    }
+
+
+def _debug_paper_qr_reply(workspace: DebugPaperWorkspace) -> str:
+    return "\n".join(
+        [
+            "调试纸副本文档创建入口已准备好。这是飞书原生表单，不依赖外部网页。",
+            "",
+            f"- 创建入口：{workspace.form_url}",
+            f"- 处理记录表：{workspace.table_url}",
+            f"- 新文档保存文件夹：{workspace.target_folder_url}",
+            "",
+            "用户流程：打开/扫码创建入口 → 飞书登录 → 填写“新文档名称” → 第二行“生成后的文档打开链接”不用填 → 提交。",
+            f"提交后稍等片刻，机器人会自动复制 `调试纸CN.docx`，并把新文档链接写回第二行；也可以在处理记录表查看：{workspace.table_url}",
+            "",
+            "表单里用户只需要填第一行名字，第二行由后端自动维护。",
+        ]
+    )
 
 
 def _parse_agent_runtime_command(text: str) -> str | None:
@@ -941,6 +1182,174 @@ async def _agent_upload_recent_artifact_to_feishu(
     )
 
 
+def _session_source_label(*, chat_id: str | None, chat_type: str | None, sender_open_id: str | None) -> str:
+    session = resolve_chat_session(chat_id=chat_id, chat_type=chat_type, sender_open_id=sender_open_id)
+    return session.session_key
+
+
+def _recent_conversation_texts(memory: ChatMemoryService, *, rounds: int = 4) -> list[str]:
+    texts: list[str] = []
+    for item in memory.recent_messages(rounds=rounds):
+        content = str(item.content or "").strip()
+        if content:
+            texts.append(content)
+    return texts
+
+
+def _video_download_reply(
+    *,
+    workspace,
+    result: VideoDownloadResult,
+) -> str:
+    lines = [
+        "已按视频下载工作流处理，并已记录到飞书“视频下载”表格。",
+        "",
+        f"- 下载表格：{workspace.table_url}",
+        f"- 存储文件夹：{workspace.folder_url}",
+        f"- 任务状态：{result.status}",
+    ]
+    if result.file_name:
+        lines.append(f"- 文件名：`{result.file_name}`")
+    if result.file_url:
+        lines.append(f"- 文件位置：{result.file_url}")
+    if result.log and result.status != DOWNLOAD_STATUS_DONE:
+        lines.extend(["", "**详细日志**", f"```text\n{result.log[-2000:]}\n```"])
+    elif result.status == DOWNLOAD_STATUS_RUNNING:
+        lines.append("- 已开始下载，后续状态会继续回填到视频下载表格。")
+    return "\n".join(lines).strip()
+
+
+async def _maybe_run_video_download_workflow(
+    db: Session,
+    *,
+    text: str,
+    chat_id: str | None,
+    chat_type: str | None,
+    sender_open_id: str | None,
+    assistant_mode: str,
+    progress_notifier: Callable[[str], Awaitable[None]] | None = None,
+) -> str | None:
+    if assistant_mode not in {ASSISTANT_MODE_CHAT, ASSISTANT_MODE_AGENT}:
+        return None
+
+    memory = ChatMemoryService(db, chat_id=chat_id, chat_type=chat_type, sender_open_id=sender_open_id)
+    service = VideoDownloadService()
+    request = service.parse_request_from_conversation(
+        text,
+        recent_texts=_recent_conversation_texts(memory),
+        source_session=_session_source_label(chat_id=chat_id, chat_type=chat_type, sender_open_id=sender_open_id),
+    )
+    if not request:
+        return None
+
+    if progress_notifier:
+        await progress_notifier("已识别为视频下载任务，正在写入“视频下载”工作流并开始下载。")
+
+    workspace = await service.ensure_workspace()
+    result = await service.create_chat_download_task_in_workspace(workspace=workspace, request=request)
+    return _video_download_reply(workspace=workspace, result=result)
+
+
+def _parse_video_download_command(text: str) -> str | None:
+    normalized = text.strip()
+    match = re.match(r"^(?:下载视频|视频下载)(?:\s*[:：]\s*|\s+)?(.*)$", normalized, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    return (match.group(1) or "").strip()
+
+
+def _parse_video_storyboard_command(text: str) -> VideoStoryboardCommand | None:
+    normalized = text.strip()
+    match = re.match(
+        r"^(?:视频拆分镜|视频转分镜|从视频生成分镜表|视频生成分镜表)(?:\s*[:：]\s*|\s+)?(.*)$",
+        normalized,
+        flags=re.IGNORECASE | re.DOTALL,
+    )
+    if not match:
+        return None
+    body = (match.group(1) or "").strip()
+    fields = _parse_video_storyboard_fields(body)
+    video_reference = (
+        fields.get("video")
+        or fields.get("link")
+        or _first_command_url(body, include_folder=False)
+        or ""
+    ).strip()
+    if not video_reference:
+        return VideoStoryboardCommand(video_reference="")
+
+    parent_folder_url = (fields.get("folder") or fields.get("parent_folder") or "").strip()
+    if not parent_folder_url:
+        parent_folder_url = _first_command_url(body, include_folder=True, folder_only=True) or None
+    project_name = (fields.get("project_name") or fields.get("name") or "").strip() or None
+    sample_count = _parse_positive_int(fields.get("sample_count"), default=10, minimum=3, maximum=20)
+    target_shots = _parse_positive_int(fields.get("target_shots"), default=0, minimum=3, maximum=30) or None
+    return VideoStoryboardCommand(
+        video_reference=video_reference,
+        project_name=project_name,
+        parent_folder_url=parent_folder_url,
+        sample_count=sample_count,
+        target_shots=target_shots,
+    )
+
+
+def _parse_video_storyboard_fields(body: str) -> dict[str, str]:
+    aliases = {
+        "video": {"视频", "视频链接", "文件", "文件链接", "飞书文件", "video", "file"},
+        "link": {"链接", "地址", "url", "link"},
+        "project_name": {"项目名", "项目名称", "分镜项目名", "project", "project_name"},
+        "name": {"名称", "name"},
+        "folder": {"目录", "文件夹", "目标文件夹", "folder", "parent_folder"},
+        "sample_count": {"抽帧数", "采样帧数", "sample", "sample_count", "frames"},
+        "target_shots": {"镜头数", "分镜数", "行数", "shots", "target_shots"},
+    }
+    alias_to_field = {
+        alias.lower(): field_name
+        for field_name, field_aliases in aliases.items()
+        for alias in field_aliases
+    }
+    pattern = re.compile(
+        r"(?P<key>%s)\s*[:=：]\s*" % "|".join(re.escape(alias) for alias in sorted(alias_to_field, key=len, reverse=True)),
+        flags=re.IGNORECASE,
+    )
+    matches = list(pattern.finditer(body))
+    fields: dict[str, str] = {}
+    for index, item in enumerate(matches):
+        field_name = alias_to_field[item.group("key").lower()]
+        start = item.end()
+        end = matches[index + 1].start() if index + 1 < len(matches) else len(body)
+        fields[field_name] = body[start:end].strip().strip("；;")
+    return fields
+
+
+def _first_command_url(raw: str, *, include_folder: bool, folder_only: bool = False) -> str | None:
+    patterns = [
+        r"https?://[^\s，,。；;]+/drive/folder/[A-Za-z0-9]+",
+        r"https?://[^\s，,。；;]+/file/[A-Za-z0-9]+",
+        r"https?://[^\s，,。；;]+",
+    ]
+    for pattern in patterns:
+        for item in re.finditer(pattern, raw):
+            url = item.group(0).strip()
+            is_folder = "/drive/folder/" in url
+            if folder_only and not is_folder:
+                continue
+            if is_folder and not include_folder:
+                continue
+            return url
+    return None
+
+
+def _parse_positive_int(value: str | None, *, default: int, minimum: int, maximum: int) -> int:
+    raw = str(value or "").strip()
+    if not raw:
+        return default
+    match = re.search(r"\d+", raw)
+    if not match:
+        return default
+    return max(minimum, min(int(match.group(0)), maximum))
+
+
 def _parse_chatbot_model_command(text: str) -> str | None:
     normalized = re.sub(r"\s+", " ", text.strip())
     match = re.match(r"^(?:切换chatbot模型|切换聊天模型|切换文本模型|chatbot模型)\s+(\S+)$", normalized, flags=re.IGNORECASE)
@@ -956,6 +1365,14 @@ def _parse_chatbot_model_command(text: str) -> str | None:
         "google/gemini-3.1-pro-preview",
         "google/gemini-3.1-flash-lite-preview",
     } else None
+
+
+def _parse_switch_current_project_command(text: str) -> str | None:
+    normalized = re.sub(r"\s+", " ", text.strip())
+    match = re.match(r"^(?:切换当前项目|切换项目|绑定当前项目|绑定项目)\s+(.+)$", normalized, flags=re.IGNORECASE | re.DOTALL)
+    if not match:
+        return None
+    return (match.group(1) or "").strip()
 
 
 def _parse_project_command(text: str) -> dict[str, str] | None:
@@ -980,7 +1397,15 @@ def _parse_project_command(text: str) -> dict[str, str] | None:
         return {"action": "project.set_keyframes", "batch_no": batch_no, "enabled": "false"}
     if normalized in {"同步表格", "同步分镜表", "同步"}:
         return {"action": "project.sync", "batch_no": batch_no}
-    if normalized in {"查看进度", "进度", "项目进度"}:
+    if normalized in {"查看进度", "查询进度", "进度", "项目进度", "查询项目进度", "表格链接", "查看表格", "项目表格", "项目文件夹", "文件夹链接"}:
+        return {"action": "project.progress", "batch_no": batch_no}
+    return None
+
+
+def _parse_natural_project_query_command(text: str) -> dict[str, str] | None:
+    batch_no = _extract_batch_no(text) or "batch_001"
+    normalized = re.sub(r"\s+", "", text.strip().lower())
+    if normalized in {"查看进度", "查询进度", "进度", "项目进度", "查询项目进度", "表格链接", "查看表格", "项目表格", "项目文件夹", "文件夹链接"}:
         return {"action": "project.progress", "batch_no": batch_no}
     return None
 
@@ -1014,11 +1439,8 @@ def _parse_direct_generation_command(text: str) -> DirectGenerationCommand | Non
     if kind == "video" and normalized_model not in DIRECT_VIDEO_MODELS:
         return DirectGenerationCommand(kind=kind, model=model, prompt=prompt)
 
-    duration = None
-    raw_duration = str(fields.get("duration_seconds") or "").strip()
-    if raw_duration:
-        digits = re.sub(r"[^\d]", "", raw_duration)
-        duration = int(digits) if digits else None
+    duration = _parse_seconds_field(fields.get("duration_seconds"))
+    keyframe_time = _parse_seconds_field(fields.get("keyframe_time_seconds"))
 
     return DirectGenerationCommand(
         kind=kind,
@@ -1027,6 +1449,7 @@ def _parse_direct_generation_command(text: str) -> DirectGenerationCommand | Non
         negative_prompt=str(fields.get("negative_prompt") or "").strip(),
         size=str(fields.get("size") or "").strip() or None,
         duration_seconds=duration,
+        keyframe_time_seconds=keyframe_time,
         reference_images=tuple(_split_command_urls(str(fields.get("reference_images") or ""))),
         first_frame=tuple(_split_command_urls(str(fields.get("first_frame") or ""))),
         last_frame=tuple(_split_command_urls(str(fields.get("last_frame") or ""))),
@@ -1370,7 +1793,12 @@ async def _handle_direct_generation_command(
             )
         return {"message": "直接生成命令缺少参数", "data": {"kind": command.kind}}
 
-    project = ProjectService(db).latest_for_chat(target_chat)
+    project = _current_chat_project(
+        db,
+        chat_id=target_chat,
+        chat_type=chat_type,
+        sender_open_id=sender_open_id,
+    )
     workflow = WorkflowService(db)
     provider_name = workflow._infer_provider(kind=command.kind, provider="auto", model_id=command.model)
     if command.kind == "image" and command.model not in DIRECT_IMAGE_MODELS:
@@ -1441,7 +1869,7 @@ async def _handle_direct_generation_command(
                     "**直接生成视频已完成**",
                     f"- 模型：`{command.model}`",
                     f"- Provider：`{provider_name}`",
-                    f"- 时长：`{command.duration_seconds or _default_direct_duration(project)} 秒`",
+                    f"- 时长：`{_format_seconds(command.duration_seconds or _default_direct_duration(project))} 秒`",
                     f"- 首帧：{len(first_frame)} 张" if first_frame else "- 首帧：未使用",
                     f"- 尾帧：{len(last_frame)} 张" if last_frame else "- 尾帧：未使用",
                     f"- 参考图/关键帧：{len(reference_images) + len(keyframes)} 张",
@@ -1492,6 +1920,7 @@ async def _generate_direct_video(
         "prompt": command.prompt,
         "negative_prompt": command.negative_prompt,
         "duration_seconds": command.duration_seconds or None,
+        "keyframe_time_seconds": command.keyframe_time_seconds,
         "first_frame_url": first_frame[0] if first_frame else None,
         "last_frame_url": last_frame[0] if last_frame else None,
         "reference_image_url": reference_images[0] if reference_images else None,
@@ -1578,8 +2007,29 @@ def _default_direct_image_size(project: Project | None) -> str:
     return {"16:9": "1280*720", "9:16": "720*1280", "1:1": "1024*1024"}.get(aspect_ratio, settings.dashscope_image_size)
 
 
-def _default_direct_duration(project: Project | None) -> int:
-    return int(((project.workflow_config or {}).get("duration_seconds") if project else None) or 5)
+def _parse_seconds_field(value) -> float | None:
+    raw = str(value or "").strip()
+    if not raw:
+        return None
+    match = re.search(r"\d+(?:\.\d+)?", raw)
+    if not match:
+        return None
+    parsed = float(match.group(0))
+    return parsed if parsed > 0 else None
+
+
+def _format_seconds(value) -> str:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if seconds.is_integer():
+        return str(int(seconds))
+    return f"{seconds:.2f}".rstrip("0").rstrip(".")
+
+
+def _default_direct_duration(project: Project | None) -> float:
+    return float(((project.workflow_config or {}).get("duration_seconds") if project else None) or 5)
 
 
 def _direct_filename(*, prefix: str, mime_type: str, fallback_suffix: str) -> str:
@@ -1620,9 +2070,9 @@ def _direct_command_help(kind: str) -> str:
         "- `/直接生成视频`\n"
         f"- `模型={VIDEO_MODEL_XYQ}`\n"
         "- `提示词=镜头缓慢推近，蒸汽自然上升`\n"
-        "- 可选：`时长=5`\n"
+        "- 可选：`时长=5` 或 `时长=3.5`\n"
         "- 图生视频可选：`首帧=https://xxx.feishu.cn/file/A`、`尾帧=https://xxx.feishu.cn/file/B`\n"
-        "- 也可选：`参考图=`、`关键帧=`"
+        "- 也可选：`参考图=`、`关键帧=`、`关键帧时间点=2.5`"
     )
 
 
@@ -1734,11 +2184,14 @@ def _chatbot_system_prompt(*, session_type: str, active_model: str, assistant_mo
             "可执行命令只有这些："
             "/新建分镜项目：项目名；/优化当前批次 Prompt；/生成全部图片；/生成全部视频；/生成全部图片和视频；"
             "/启动首尾帧同步；/关闭首尾帧同步；/启动关键帧生成；/关闭关键帧生成；/同步表格；/查看进度；"
+            "/视频拆分镜 视频=<飞书视频文件链接> 项目名=<可选> 镜头数=<可选> 抽帧数=<可选>；"
             "/切换chatbot模型 qwen-plus|qwen-max|gpt-5.4|deepseek-v4-pro|deepseek-v4-flash|google/gemini-3.1-pro-preview|google/gemini-3.1-flash-lite-preview；"
             "/直接生成图片（用 模型=、提示词=、可选 尺寸=、参考图=）；"
-            "/直接生成视频（用 模型=、提示词=、可选 时长=、首帧=、尾帧=、参考图=、关键帧=）。\n"
+            "/直接生成视频（用 模型=、提示词=、可选 时长=、首帧=、尾帧=、参考图=、关键帧=、关键帧时间点=）。\n"
             "工作流规则：默认生成首帧和尾帧；只有在“启动关键帧生成”后，才会为镜头批量生成关键帧候选。"
-            "开启“首尾帧同步”后，后一镜头首帧会复用前一镜头尾帧。你可以建议用户何时开启这些能力，但不能替他执行。\n"
+            "开启“首尾帧同步”后，后一镜头首帧会复用前一镜头尾帧。"
+            "表格里的 `选中关键帧图` 是可选视频中间关键帧输入，空置=不使用；`关键帧时间点` 控制该关键帧出现在第几秒；`视频时长` 控制单镜视频总长度，默认 5 秒且允许小数。"
+            "你可以建议用户何时开启这些能力，但不能替他执行。\n"
             f"{web_search_summary}\n"
             "模型建议规则：当用户询问“该选哪个模型”或“为什么失败”时，你必须优先依据下面这份最近一次实测状态回答，而不是只按模型名字猜测。\n"
             f"{capability_summary}\n"
@@ -1755,7 +2208,8 @@ def _chatbot_system_prompt(*, session_type: str, active_model: str, assistant_mo
         "如果用户发来飞书文档、飞书文件或 docx，并且意图明显是拆成分镜，不要凭空说“这个文档之前已经拆解过”；"
         "应直接建议用户发送 `/分镜拆解 文档链接`，或者在分镜拆解模式下继续处理。"
         "当用户要执行飞书分镜相关操作时，不要假装已经操作成功，要明确提示对应斜杠命令。"
-        "常用命令包括：/Agent、/Agent deepseek、/切换Agent模型 codex|deepseek、/Deep Research、/拆分镜需求、/分镜拆解、/重新拆解、/分镜助手、/视频助手、/普通助手、/help、/New session、/切换chatbot模型。\n"
+        "常用命令包括：/Agent、/Agent deepseek、/切换Agent模型 codex|deepseek、/切换当前项目 <表格链接>、/Deep Research、/拆分镜需求、/分镜拆解、/重新拆解、/分镜助手、/视频助手、/普通助手、/help、/New session、/切换chatbot模型。\n"
+        "分镜表字段提示：`选中关键帧图` 可作为视频中间关键帧输入；`关键帧时间点` 指定该关键帧出现秒数；`视频时长` 指定单镜视频总长度，默认 5 秒。\n"
         f"{web_search_summary}\n"
         "回答要求：中文优先，简洁直接，信息不确定时要说明不确定。"
         "如果问题明显和分镜工作流有关，可以建议用户切到 `/分镜助手` 或使用对应命令。\n"
@@ -1772,7 +2226,11 @@ def _agent_deepseek_system_prompt(*, session_type: str) -> str:
         "你没有 Codex 的本地工具和代码执行能力，不要假装已经查了本地代码、跑了命令、改了文件或操作了飞书。"
         "如果用户明确要使用当前项目已有功能，要优先指向现有命令和体系，而不是自己模拟："
         "分镜工作流用 `/分镜助手` 或 `/视频助手`；深度研究用 `/Deep Research`；分镜拆解用 `/分镜拆解`；普通聊天用 `/普通助手`。"
+        "分镜表字段里，`选中关键帧图` 是可选视频中间关键帧输入，`关键帧时间点` 是它应出现在第几秒，`视频时长` 是单镜视频总长度，默认 5 秒并允许小数。"
         "如果用户是在排查这些功能的逻辑、报错或实现细节，你可以解释已知规则，但要明确说明你当前不能直接读取本地代码。"
+        "当用户要求修改已有文案、整理现有文档或润色已经写好的稿件时，默认采用修订模式：保留原文并加删除线，在后面追加替换文本，并用黄色高亮标出新增内容。"
+        "如果文档里已经存在删除线、高亮、批注或其他手动修订痕迹，不要继续直接改写；先在聊天里输出一个简短修改计划，等用户确认后再统一执行。"
+        "除非用户明确要求全文重写，否则不要把整份文案删掉重写。"
         "回答要求：中文优先，直接、结构化、别装作已经执行成功。"
         f"\n{session_summary}"
     )
@@ -1794,29 +2252,204 @@ def _openclaw_agent_session_file(session_id: str) -> Path:
     return Path.home() / ".openclaw" / "agents" / "main" / "sessions" / f"{session_id}.jsonl"
 
 
+def _agent_project_context(
+    db: Session,
+    *,
+    chat_id: str | None,
+    chat_type: str | None,
+    sender_open_id: str | None,
+) -> str:
+    if not chat_id and not sender_open_id:
+        return ""
+    project = _current_chat_project(db, chat_id=chat_id, chat_type=chat_type, sender_open_id=sender_open_id)
+    if not project:
+        return ""
+    storyboard = FeishuStoryboardService(db)
+    table_url = storyboard._project_table_url(project)
+    folder_url = storyboard._project_folder_url(project)
+    stats = storyboard.progress_stats(project)
+    lines = [
+        "当前聊天绑定的项目上下文（这是默认候选项目，不是唯一真相；用于回答进度、表格链接、文件夹链接等问题；引用时优先使用这些真实链接，不要省略；给用户回链时直接输出完整 URL，不要只用 Markdown 链接文本）：",
+        f"- 项目名：{project.name}",
+        f"- 表格链接：{table_url or '未配置'}",
+        f"- 项目文件夹链接：{folder_url or '未配置'}",
+        f"- 镜头总数：{stats.get('total', 0)}",
+        f"- Prompt 已优化：{stats.get('prompt_optimized', 0)} / {stats.get('prompt_pending', 0)} 待优化",
+        f"- 图片生成：{stats.get('image_done', 0)} 完成 / {stats.get('image_generating', 0)} 进行中",
+        f"- 视频生成：{stats.get('video_done', 0)} 完成 / {stats.get('video_generating', 0)} 进行中",
+        f"- 待审核：{stats.get('pending_review', 0)}",
+        f"- 待验收：{stats.get('pending_acceptance', 0)}",
+        f"- 错误数：{stats.get('errors', 0)}",
+        "- 分镜表新字段说明：`选中关键帧图` 是可选视频中间关键帧输入，空置表示不使用；`关键帧时间点` 是该关键帧应出现在视频第几秒，允许小数；`视频时长` 控制单镜视频总长度，默认 5 秒，允许小数。",
+        "- 若用户要求调整关键帧/时长，应更新对应表格字段后再启动生成；若用户手动上传了 `选中关键帧图`，也要把它当作视频生成输入。",
+        "- 默认视频文件夹 `03_视频` 会保留每个镜头当前最新视频，旧版本/未选中视频会移动到 `03_视频/ARCHIVED`，不要把 ARCHIVED 当作失败或删除。",
+        "- 重要规则：如果用户当前消息、上一条材料、飞书链接、表格标题或描述明显指向另一个分镜表/项目，不要机械使用这里这个项目。应优先根据用户当前上下文确认真正要处理的表格；不确定时先明确追问或先复述你识别到的候选表格。",
+    ]
+    return "\n".join(lines)
+
+
+def _current_chat_project(
+    db: Session,
+    *,
+    chat_id: str | None,
+    chat_type: str | None = None,
+    sender_open_id: str | None = None,
+    preferences: ChatPreferenceService | None = None,
+) -> Project | None:
+    project_service = ProjectService(db)
+    prefs = preferences or ChatPreferenceService(db)
+    active_project_id = prefs.get_active_project_id(
+        chat_id=chat_id,
+        chat_type=chat_type,
+        sender_open_id=sender_open_id,
+    )
+    if active_project_id:
+        try:
+            project = project_service.get_project(UUID(active_project_id))
+        except Exception:
+            project = None
+        if project and (not chat_id or (project.workflow_config or {}).get("chat_id") == chat_id):
+            return project
+    return project_service.latest_for_chat(chat_id)
+
+
+def _maybe_bind_project_from_message(
+    db: Session,
+    *,
+    text: str,
+    chat_id: str | None,
+    chat_type: str | None,
+    sender_open_id: str | None,
+    preferences: ChatPreferenceService | None = None,
+) -> Project | None:
+    if not text or not chat_id:
+        return None
+    project = _find_project_from_message_links(db, text)
+    if not project:
+        return None
+    prefs = preferences or ChatPreferenceService(db)
+    prefs.set_active_project_id(
+        chat_id=chat_id,
+        chat_type=chat_type,
+        sender_open_id=sender_open_id,
+        project_id=str(project.id),
+    )
+    db.commit()
+    return project
+
+
+def _find_project_from_message_links(db: Session, text: str) -> Project | None:
+    project_service = ProjectService(db)
+    for url in _extract_message_urls(text):
+        parsed = urlparse(url)
+        if "/base/" not in (parsed.path or ""):
+            continue
+        parts = [part for part in (parsed.path or "").split("/") if part]
+        if "base" not in parts:
+            continue
+        index = parts.index("base")
+        if len(parts) <= index + 1:
+            continue
+        app_token = parts[index + 1]
+        table_id = parse_qs(parsed.query).get("table", [None])[0]
+        project = project_service.find_by_feishu_table(app_token, table_id)
+        if project:
+            return project
+    return None
+
+
+def _agent_document_revision_policy() -> str:
+    return (
+        "文档/文案修订规则（强约束）：\n"
+        "- 当用户要求修改已有文案、整理已有稿件、润色现有文档时，默认进入“修订模式”，不要直接整段删除再重写。\n"
+        "- 对需要替换的原文：保留原文并加删除线；紧跟在后面插入替换文本，并用黄色高亮标出新增内容。\n"
+        "- 对未改动的内容：保持原有结构、段落顺序、编号和格式，不要为了省事整体重写。\n"
+        "- 只有当用户明确要求“整段重写”“全文重写”“重做一版”时，才允许整体重写。\n"
+        "- 如果目标文档已经存在明显修订痕迹（删除线、高亮、批注、修订版标记，或用户手动改过），先不要继续批量修改。先在聊天里给出简短修改计划，说明准备改哪些段、保留哪些已有修订，等待用户确认后再统一执行。\n"
+        "- 如果当前工具或接口不能可靠表达“删除线 + 黄色高亮”，先明确说明限制并给出修改计划，不要退化成直接删除原文再重写。"
+    )
+
+
+def _agent_video_download_workflow_policy() -> str:
+    return (
+        "视频下载工作流（Agent 强约束）：\n"
+        "- 当用户要求下载视频、保存 YouTube/外部视频、下载文档批注/评论里的视频链接，必须走当前项目的正式视频下载工作流，不要自己直接运行 `yt-dlp`、`videodl`、`curl` 或写临时 shell 脚本把文件只存到本地。\n"
+        "- 正式工作流代码入口：`/Users/applemima111/Desktop/动画/bicaraifilm/bicar_ai_storyboard/backend/app/services/video_downloads.py`，核心类是 `VideoDownloadService`。它会保存到飞书 `AI生成/视频下载`，并登记到飞书“视频下载”多维表格。\n"
+        "- 文件夹规则：如果视频来自某个飞书文档的正文/批注/评论，必须在 `AI生成/视频下载` 下为该文档创建或复用一个以“飞书文档原名”命名的子文件夹，禁止命名成 `文档_<token>` 这类机器名；所有来自同一文档的视频放在同一个文档原名子文件夹。如果不是文档来源，就放进 `AI生成/视频下载/非文档视频下载`。下载表格会用 `目标文件夹` 字段记录实际文件夹。\n"
+        "- 如果是单个或少量视频：在 `backend` 目录用 `.venv311/bin/python3` 调用 `VideoDownloadService.ensure_workspace()` 和 `create_chat_download_task_in_workspace(...)`，让服务创建表格记录、下载、上传、回填状态与文件位置。\n"
+        "- 下载前必须去重：先按 YouTube video_id 或规范化 URL 检查“视频下载”表格是否已有同一链接；已有 `已下载` 记录时直接返回现有文件位置，已有 `正在下载/未开始/启动/下载失败` 记录时复用原记录处理，不要再新建重复行、重复上传同名文件。\n"
+        "- 文件命名规则：不要把文件命名成 `主题_YouTubeID.mp4` 这种弱名字。优先级为：用户明确指定文件名 > 同一条飞书批注/评论里和 YouTube 链接同时出现的文字 > YouTube 原标题 > 飞书批注/评论旁边的原文语境。只要某个批注/回复里同时有文字和 YouTube 链接，就把该文字当作视频名传给下载工作流，不要再覆盖成 YouTube 原标题。只有没有人工文字时，才使用 YouTube 原标题，并在标题后追加 `（批注内容：xxxxx）`；若仍然重名，由正式服务追加 video_id 短后缀，确保云盘里没有重名文件。\n"
+        "- 如果是批量/长列表视频：不要在一个 Agent 回合里同步下载全部视频。应先读取飞书文档正文和批注/评论里的真实视频链接，对链接按 YouTube video_id 或规范化 URL 去重，再把每条唯一链接登记到“视频下载”表格，状态设为 `启动` 或 `未开始`，写入 `comments`、`来源会话`、`创建时间`。如果来自飞书文档，`comments` 必须使用统一结构：`来源文档：<文档原名> <文档链接>`、`批注 ID：<id>`、`批注位置：<quote>`、`批注说明：<同条链接旁人工文字>`、`原始链接：<url>`；不得只写 `文档批注引用`、`克尔维特文档评论` 这类不可追溯备注。`文件名` 字段只有在用户明确指定文件名、或源飞书批注里同条链接旁边有人工文字说明时才填写，不允许填 `克尔维特_VIDEO_ID` 这类机器名。登记后让表格工作流逐条处理；回复用户表格链接、排队数量、已识别链接数和去重后的唯一链接数。\n"
+        "- 下载质量与重试由正式服务负责：YouTube 默认走最高画质 `yt-dlp` 路径，失败会自动重试 3 次并在 `log` 字段保留完整失败原因；不要绕过服务自行下载低清版本。\n"
+        "- 任何对话发起的视频下载，都必须能在“视频下载”表格里查到记录；最终回复必须给出下载表格链接或文件位置，不能只给本地路径。\n"
+        "- 读取飞书文档批注/划线评论/评论内容时，不要只读正文。先从 `/docx/<doc_token>` 提取 `doc_token`，`preview_comment_id` 只是定位评论的参数，不是文档 token。\n"
+        "- 飞书评论读取方法：使用项目的 `FeishuClient` 获取 tenant token 后调用 `GET /open-apis/drive/v1/files/{doc_token}/comments?file_type=docx&page_size=100`，如果 `has_more` 为真，继续带 `page_token=next_page_token` 翻页。\n"
+        "- 如果需要写回批注，请优先使用项目内 `FeishuClient.list_file_comments(...)` 和 `FeishuClient.add_file_comment_reply(...)`，不要临时猜飞书评论接口结构。\n"
+        "- 评论链接提取范围：遍历每个 comment 及 `reply_list.replies` 的 `content.elements`，同时读取 `docs_link.url` 和 `text_run.text` 里的明文 URL；如果同一个 comment/reply 中既有 YouTube 链接又有文字说明，必须把这段文字作为该链接的 `filename_hint` 或 `文件名`，并同时保留到 `comments`。\n"
+        "- 判断是否需要补视频名批注时，要逐个 YouTube 链接检查它在同一个 comment/reply 元素序列里的左右文字；不是只看整条批注是否有文字。只要某个 YouTube 链接左右都没有人工说明文字，就必须解析 YouTube 标题后，在源批注线程回复 `YouTube视频名：xxxxx`；多个无名链接就逐行写 `YouTube视频名：<序号>. xxxxx`。不要改正文，也不要只把标题写到下载表格里。\n"
+        "- 如果评论 API 权限不足、接口报错或确实没有链接，必须把具体接口/错误原因告诉用户，不要编造“已下载”或退回本地下载脚本。"
+    )
+
+
+def _agent_video_storyboard_workflow_policy() -> str:
+    return (
+        "视频拆分镜工作流（Agent 工具说明）：\n"
+        "- 当用户明确要求“把视频拆成分镜/根据视频生成分镜表/参考视频新建分镜项目/从视频抽镜头脚本”时，不要只给空模板，也不要只凭文件名臆测内容；应调用正式的“下载视频 → 抽帧 → 视觉模型 → 生成分镜表”工作流。\n"
+        "- 正式入口是显式命令：`/视频拆分镜 视频=<飞书文件链接或可下载视频链接> 项目名=<项目名> 镜头数=<可选> 抽帧数=<可选> 目录=<可选飞书文件夹>`；同义命令包括 `/视频转分镜`、`/从视频生成分镜表`。\n"
+        "- 后端代码入口：`/Users/applemima111/Desktop/动画/bicaraifilm/bicar_ai_storyboard/backend/app/services/video_storyboard.py`，核心类是 `VideoStoryboardService`。它会下载视频、用 ffmpeg 抽帧、调用视觉模型分析画面、创建飞书分镜项目并写入分镜表。\n"
+        "- 这是工具选择，不是关键词硬拦截：只有当用户任务语义确实是“从视频生成/更新分镜表”时才用；如果用户只是问视频能不能用、让你解释流程、或只是聊天，不要擅自启动。\n"
+        "- 工作流默认只创建和填写分镜表，不自动启动图片或视频生成；完成后提醒用户先检查表格，再用 `/生成全部图片` 或表格状态启动后续生成。\n"
+        "- 如果用户附的是飞书视频文件卡片，消息文本里通常会有 `https://.../file/<token>`；把这个链接作为 `视频=` 传入。若拿不到链接，要明确请求用户补发文件链接，而不是输出泛化模板。\n"
+        "- 如果用户要求在指定文件夹里创建项目，把飞书文件夹链接作为 `目录=` 传入；否则使用默认 `AI生成/分镜项目` 工作区。"
+    )
+
+
+def _agent_storyboard_table_policy() -> str:
+    return (
+        "分镜表字段与生成规则（Agent 强约束）：\n"
+        "- 分镜表里 `首帧图`、`尾帧图`、`选中关键帧图` 都是视频生成输入；`选中关键帧图` 为空表示不使用中间关键帧，用户手动上传附件也应被当作有效输入。\n"
+        "- `关键帧图` 是系统生成的候选关键帧；`选中关键帧图` 是真正送入视频模型的关键帧。不要把两列混用。\n"
+        "- `关键帧时间点` 是 `选中关键帧图` 应出现在视频第几秒，允许小数；如果用户要求某张关键帧出现在 2.5 秒处，就更新这列为 `2.5`。\n"
+        "- `视频时长` 是单镜视频总长度，默认 `5` 秒，允许小数；如果用户要求 3.5 秒、6 秒等，应更新这列再启动视频生成。\n"
+        "- 小云雀生成时会把首尾帧、关键帧、关键帧时间点和视频时长共同作为约束；如果结果不符合，需要调整表格字段后重新启动生成，不要只口头说明。\n"
+        "- 默认 `03_视频` 文件夹会只保留每个镜头当前最新视频；旧版本或未选中视频会移动到 `03_视频/ARCHIVED`。这是归档整理，不是删除。"
+    )
+
+
 def _compose_openclaw_agent_message(
     *,
     session_id: str,
     memory: ChatMemoryService,
     text: str,
+    project_context: str = "",
 ) -> str:
+    sections: list[str] = []
+    sections.append(_agent_document_revision_policy())
+    sections.append(_agent_video_download_workflow_policy())
+    sections.append(_agent_video_storyboard_workflow_policy())
+    sections.append(_agent_storyboard_table_policy())
+    if project_context:
+        sections.append(project_context)
     if _openclaw_agent_session_file(session_id).exists():
-        return text
+        sections.append(text)
+        return "\n\n".join(part for part in sections if part).strip()
     recent = memory.recent_messages(rounds=4)
-    if not recent:
-        return text
-    lines = ["会话延续上下文（仅供续接当前任务，不要逐字复述）："]
-    for item in recent:
-        role = "用户" if item.role == "user" else "助手"
-        content = (item.content or "").strip()
-        if not content:
-            continue
-        if len(content) > 500:
-            content = content[:497] + "..."
-        lines.append(f"{role}：{content}")
-    lines.append("")
-    lines.append(f"当前新请求：{text}")
-    return "\n".join(lines).strip()
+    if recent:
+        lines = ["会话延续上下文（仅供续接当前任务，不要逐字复述）："]
+        for item in recent:
+            role = "用户" if item.role == "user" else "助手"
+            content = (item.content or "").strip()
+            if not content:
+                continue
+            if len(content) > 500:
+                content = content[:497] + "..."
+            lines.append(f"{role}：{content}")
+        lines.append("")
+        lines.append(f"当前新请求：{text}")
+        sections.append("\n".join(lines).strip())
+        return "\n\n".join(part for part in sections if part).strip()
+    sections.append(text)
+    return "\n\n".join(part for part in sections if part).strip()
 
 
 async def _run_openclaw_agent(
@@ -1827,11 +2460,9 @@ async def _run_openclaw_agent(
     session_key: str | None = None,
     model: str | None = None,
 ) -> dict[str, Any]:
-    binary = shutil.which("openclaw")
-    if not binary:
-        raise RuntimeError("OpenClaw 未安装或不在 PATH 中。")
+    command = _resolve_openclaw_command()
     args = [
-        binary,
+        *command,
         "agent",
         "--session-id",
         session_id,
@@ -1901,7 +2532,107 @@ def _extract_openclaw_agent_reply(payload: dict[str, Any]) -> str:
         normalized = _normalize_assistant_reply(candidate)
         if normalized:
             return normalized
+    fallback = _openclaw_error_fallback_message(payload)
+    if fallback:
+        return fallback
+    if _openclaw_payload_indicates_success(payload):
+        return (
+            "⚠️ 本次由系统兜底收尾：Agent 可能已经执行了部分操作，但 OpenClaw 没有返回最终可发送正文。\n"
+            "请先核对表格、文档、文件夹或其他产物是否已经发生变化；如果这种情况再次出现，请联系开发者排查。"
+        )
     raise RuntimeError("OpenClaw Agent 没有返回可发送的文本结果。")
+
+
+def _openclaw_error_fallback_message(payload: Any) -> str | None:
+    kind, detail = _classify_openclaw_payload_error(payload)
+    if not kind:
+        return None
+
+    if kind == "timeout":
+        reason = "Agent 这次执行超时了，OpenClaw 没有返回最终可发送正文。"
+        next_step = "这通常表示任务卡在工具执行或长时间下载/处理里；可能已经产生部分结果，请先核对表格、文档、文件夹或下载目录。"
+    elif kind == "rate_limit":
+        reason = "Agent 这次遇到了限流错误，OpenClaw 没有返回最终可发送正文。"
+        next_step = "请稍后重试；如果任务已经执行过一部分，先核对相关产物，避免重复操作。"
+    elif kind == "billing":
+        reason = "Agent 这次遇到了额度或计费错误，OpenClaw 没有返回最终可发送正文。"
+        next_step = "请检查对应模型/API 额度；如果任务已经执行过一部分，先核对相关产物。"
+    elif kind == "aborted":
+        reason = "Agent 这次任务被中止或请求被取消，OpenClaw 没有返回最终可发送正文。"
+        next_step = "请先核对是否已有部分操作完成；如果不是你主动停止的，请联系开发者排查。"
+    else:
+        reason = "Agent 这次返回了错误状态，但 OpenClaw 没有返回最终可发送正文。"
+        next_step = "请先核对表格、文档、文件夹或其他产物是否已经发生变化。"
+
+    lines = [
+        f"⚠️ 本次由系统兜底收尾：{reason}",
+        next_step,
+    ]
+    if detail:
+        lines.extend(["", f"错误线索：`{detail}`"])
+    lines.append("如果这种情况再次出现，请联系开发者排查。")
+    return "\n".join(lines).strip()
+
+
+def _classify_openclaw_payload_error(payload: Any) -> tuple[str | None, str | None]:
+    strings: list[str] = []
+    timeout_flag = False
+
+    def walk(value: Any, key: str | None = None) -> None:
+        nonlocal timeout_flag
+        if key in {"timedOut", "timedOutDuringToolExecution"} and value is True:
+            timeout_flag = True
+        if isinstance(value, dict):
+            for child_key, child_value in value.items():
+                strings.append(str(child_key))
+                walk(child_value, str(child_key))
+        elif isinstance(value, list):
+            for item in value:
+                walk(item, key)
+        elif isinstance(value, str):
+            strings.append(value)
+        elif isinstance(value, bool):
+            strings.append(str(value))
+
+    walk(payload)
+    joined = " ".join(strings).lower()
+
+    def first_matching(*needles: str) -> str | None:
+        matches: list[str] = []
+        for text in strings:
+            lowered = text.lower()
+            if any(needle in lowered for needle in needles):
+                matches.append(text.strip())
+        if not matches:
+            return None
+        return max(matches, key=len)[:240]
+
+    if timeout_flag or any(needle in joined for needle in ("request timed out", "timed out", "timeout", "timedout")):
+        return "timeout", first_matching("request timed out", "timed out", "timeout", "timedout")
+    if any(needle in joined for needle in ("rate limit", "rate_limit", "too many requests", "429")):
+        return "rate_limit", first_matching("rate limit", "rate_limit", "too many requests", "429")
+    if any(needle in joined for needle in ("payment required", "billing", "quota", "insufficient balance", "402")):
+        return "billing", first_matching("payment required", "billing", "quota", "insufficient balance", "402")
+    if any(needle in joined for needle in ("aborted", "cancelled", "canceled", "request was aborted")):
+        return "aborted", first_matching("aborted", "cancelled", "canceled", "request was aborted")
+    if any(needle in joined for needle in ("error", "failed", "exception")):
+        return "error", first_matching("error", "failed", "exception")
+    return None, None
+
+
+def _openclaw_payload_indicates_success(payload: Any) -> bool:
+    if not isinstance(payload, dict):
+        return False
+    status = str(payload.get("status") or "").strip().lower()
+    if status in {"ok", "success", "completed"}:
+        return True
+    result = payload.get("result")
+    if isinstance(result, dict) and result:
+        return True
+    messages = payload.get("messages")
+    if isinstance(messages, list) and any(isinstance(item, dict) for item in messages):
+        return True
+    return False
 
 
 async def _agent_reply_via_openclaw(
@@ -1931,7 +2662,17 @@ async def _agent_reply_via_openclaw(
     )
     feishu = FeishuClient()
     reaction_id: str | None = None
-    agent_message = _compose_openclaw_agent_message(session_id=session_id, memory=memory, text=text)
+    agent_message = _compose_openclaw_agent_message(
+        session_id=session_id,
+        memory=memory,
+        text=text,
+        project_context=_agent_project_context(
+            db,
+            chat_id=chat_id,
+            chat_type=chat_type,
+            sender_open_id=sender_open_id,
+        ),
+    )
     try:
         if source_message_id:
             try:

@@ -4,6 +4,7 @@ from pathlib import Path
 
 import httpx
 
+from app.adapters.feishu import FeishuClient
 from app.core.config import settings
 from app.providers.base import ImageGenerationResult, ImageProvider
 
@@ -48,6 +49,12 @@ async def _load_image_source(source: str) -> tuple[str, bytes]:
             raise RuntimeError(f"reference image does not exist: {path}")
         mime_type = mimetypes.guess_type(path.name)[0] or "image/png"
         return mime_type, path.read_bytes()
+    if source.startswith("feishu://"):
+        token = source.replace("feishu://", "", 1).strip().strip("/")
+        if not token:
+            raise RuntimeError("reference image Feishu token is empty")
+        filename, content, mime_type = await FeishuClient().download_drive_file(token)
+        return mime_type or mimetypes.guess_type(filename)[0] or "image/png", content
     async with httpx.AsyncClient(timeout=120, follow_redirects=True) as client:
         response = await client.get(source)
     response.raise_for_status()

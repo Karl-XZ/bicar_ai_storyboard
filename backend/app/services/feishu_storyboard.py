@@ -6,7 +6,7 @@ from urllib.parse import urlparse
 
 from sqlalchemy.orm import Session
 
-from app.adapters.feishu import FeishuClient
+from app.adapters.feishu import FeishuApiError, FeishuClient
 from app.adapters.feishu_cards import batch_done_card, progress_card, project_created_card
 from app.adapters.feishu_fields import bitable_field_definitions, build_field_map
 from app.core.config import settings
@@ -71,10 +71,10 @@ class FeishuStoryboardService:
                 "table_url": resources.get("table_url"),
                 "folder_url": resources.get("folder_url"),
                 "folders": resources["folders"],
-                "chat_id": chat_id or settings.feishu_default_chat_id,
+                "chat_id": chat_id,
             },
         )
-        target_chat = chat_id or settings.feishu_default_chat_id
+        target_chat = self._notification_chat_id(project=project, explicit_chat_id=chat_id)
         if target_chat:
             await self.feishu.send_card(
                 target_chat,
@@ -122,7 +122,7 @@ class FeishuStoryboardService:
         await self.sync_from_feishu(project)
         shots = self.projects.list_shots(project.id, batch_no=batch_no)
         generated = await self._generate_images_for_shots(project, shots)
-        target_chat = (project.workflow_config or {}).get("chat_id") or settings.feishu_default_chat_id
+        target_chat = self._notification_chat_id(project=project)
         if target_chat:
             await self.feishu.send_card(
                 target_chat,
@@ -367,6 +367,7 @@ class FeishuStoryboardService:
                 "文本模型": (shot.prompts or {}).get("text_model") or self._project_model(project, "text"),
                 "图片模型": (shot.prompts or {}).get("image_model") or self._project_model(project, "image"),
                 "视频模型": (shot.prompts or {}).get("video_model") or self._project_model(project, "video"),
+                "视频时长": (shot.prompts or {}).get("duration_seconds") or self._default_video_duration(project),
                 "审核状态": self._review_status_for_shot(shot),
                 "首帧同步设置": self._transition_alignment_for_shot(shot),
                 "关键帧生成设置": self._keyframe_generation_for_shot(shot, project),
@@ -381,26 +382,43 @@ class FeishuStoryboardService:
                     else ""
                 ),
             }
+            keyframe_time = (shot.prompts or {}).get("keyframe_time_seconds")
+            if keyframe_time is not None:
+                fields["关键帧时间点"] = keyframe_time
             await self._attach_assets(project, shot, fields, asset_service, folders)
             if shot.feishu_record_id:
                 records.append({"record_id": shot.feishu_record_id, "fields": fields})
         if records:
             await self.feishu.batch_update_records(project.feishu_app_token, project.feishu_table_id, records)
+        await self._archive_unselected_default_videos(project, asset_service, folders)
         self.db.commit()
 
     async def send_progress(self, project: Project, chat_id: str | None = None) -> dict:
         await self.sync_from_feishu(project)
         stats = self.progress_stats(project)
+        table_url = self._project_table_url(project)
+        folder_url = self._project_folder_url(project)
         card = progress_card(
             project_name=project.name,
             stats=stats,
-            table_url=(project.workflow_config or {}).get("table_url"),
+            table_url=table_url,
+            folder_url=folder_url,
             project_id=str(project.id),
         )
-        target = chat_id or (project.workflow_config or {}).get("chat_id") or settings.feishu_default_chat_id
+        target = self._notification_chat_id(project=project, explicit_chat_id=chat_id)
         if target:
             await self.feishu.send_card(target, card)
         return stats
+
+    def _notification_chat_id(self, *, project: Project | None = None, explicit_chat_id: str | None = None) -> str | None:
+        resolved = str(explicit_chat_id or "").strip()
+        if resolved:
+            return resolved
+        config = (project.workflow_config or {}) if project else {}
+        project_chat = str(config.get("chat_id") or "").strip()
+        if project_chat:
+            return project_chat
+        return None
 
     async def ensure_starter_records(self, project: Project, count: int = 3) -> int:
         if not project.feishu_app_token or not project.feishu_table_id:
@@ -446,7 +464,12 @@ class FeishuStoryboardService:
             field_name = item.get("field_name")
             field_id = item.get("field_id")
             if field_name in DEPRECATED_TABLE_FIELDS and field_id:
-                await self.feishu.delete_field(project.feishu_app_token, project.feishu_table_id, str(field_id))
+                try:
+                    await self.feishu.delete_field(project.feishu_app_token, project.feishu_table_id, str(field_id))
+                except FeishuApiError as exc:
+                    if exc.code == 1254046 or "Primary Field cannot be deleted" in str(exc):
+                        continue
+                    raise
 
     def progress_stats(self, project: Project) -> dict:
         shots = self.projects.list_shots(project.id)
@@ -639,6 +662,9 @@ class FeishuStoryboardService:
         }.items():
             folder = await self.feishu.create_folder(project_folder_token, name)
             folders[key] = self._extract_token(folder)
+        if folders.get("videos"):
+            archive_folder = await self.feishu.create_folder(folders["videos"], "ARCHIVED")
+            folders["videos_archived"] = self._extract_token(archive_folder)
         bitable, resolved_bitable_folder = await workspace.create_bitable_with_fallback(
             name=f"{project.name}_分镜表",
             folder_token=project_folder_token,
@@ -730,6 +756,94 @@ class FeishuStoryboardService:
             self.db.flush()
         return token
 
+    async def _archive_unselected_default_videos(
+        self,
+        project: Project,
+        asset_service: AssetService,
+        folders: dict,
+    ) -> int:
+        video_folder = str(folders.get("videos") or "").strip()
+        if not video_folder:
+            return 0
+        archive_folder = await self._ensure_video_archive_folder(project, video_folder, folders)
+        if not archive_folder:
+            return 0
+
+        keep_tokens: set[str] = set()
+        for shot in self.projects.list_shots(project.id):
+            latest = asset_service.latest_for_shot(shot.id, AssetType.VIDEO)
+            if latest and latest.feishu_drive_token and latest.feishu_drive_folder_token == video_folder:
+                keep_tokens.add(latest.feishu_drive_token)
+
+        moved = 0
+        page_token: str | None = None
+        while True:
+            response = await self.feishu.list_folder_items(video_folder, page_size=200, page_token=page_token)
+            data = response.get("data", {})
+            items = data.get("files") or data.get("items") or []
+            for item in items:
+                token = self._item_token(item)
+                if not token or token in keep_tokens:
+                    continue
+                file_type = self._item_type(item)
+                if file_type == "folder":
+                    continue
+                try:
+                    await self.feishu.move_file(token, folder_token=archive_folder, file_type=file_type)
+                    moved += 1
+                except FeishuApiError:
+                    continue
+            page_token = data.get("next_page_token") or data.get("page_token")
+            if not page_token or not data.get("has_more"):
+                break
+        return moved
+
+    async def _ensure_video_archive_folder(self, project: Project, video_folder: str, folders: dict) -> str | None:
+        existing = str(folders.get("videos_archived") or "").strip()
+        if existing:
+            return existing
+        page_token: str | None = None
+        while True:
+            response = await self.feishu.list_folder_items(video_folder, page_size=200, page_token=page_token)
+            data = response.get("data", {})
+            items = data.get("files") or data.get("items") or []
+            for item in items:
+                if self._item_type(item) == "folder" and str(item.get("name") or "").strip().upper() == "ARCHIVED":
+                    token = self._item_token(item)
+                    if token:
+                        self._remember_video_archive_folder(project, folders, token)
+                        return token
+            page_token = data.get("next_page_token") or data.get("page_token")
+            if not page_token or not data.get("has_more"):
+                break
+        try:
+            folder = await self.feishu.create_folder(video_folder, "ARCHIVED")
+        except FeishuApiError:
+            return None
+        token = self._extract_token(folder)
+        if token:
+            self._remember_video_archive_folder(project, folders, token)
+        return token or None
+
+    def _remember_video_archive_folder(self, project: Project, folders: dict, token: str) -> None:
+        folders["videos_archived"] = token
+        project.workflow_config = {
+            **(project.workflow_config or {}),
+            "folders": {**((project.workflow_config or {}).get("folders") or {}), "videos_archived": token},
+        }
+        self.db.flush()
+
+    def _item_token(self, item: dict) -> str:
+        return str(item.get("token") or item.get("file_token") or item.get("node_token") or "")
+
+    def _item_type(self, item: dict) -> str:
+        raw = str(item.get("type") or item.get("mime_type") or item.get("file_type") or "").lower()
+        if raw in {"folder", "explorer"}:
+            return "folder"
+        if raw in {"doc", "docx", "sheet", "mindnote", "bitable"}:
+            return raw
+        return "file"
+
     async def _upload_bitable_asset(self, project: Project, asset: Asset) -> str | None:
         if asset.feishu_file_token:
             return asset.feishu_file_token
@@ -788,6 +902,7 @@ class FeishuStoryboardService:
             "文本模型": self._project_model(project, "text"),
             "图片模型": self._project_model(project, "image"),
             "视频模型": self._project_model(project, "video"),
+            "视频时长": self._default_video_duration(project),
         }
         return fields
 
@@ -905,6 +1020,22 @@ class FeishuStoryboardService:
                 return f"{parsed.scheme or 'https'}://{parsed.netloc}"
         return self._feishu_site_url()
 
+    def _project_table_url(self, project: Project) -> str | None:
+        table_url = str((project.workflow_config or {}).get("table_url") or "").strip()
+        if table_url:
+            return table_url
+        if project.feishu_app_token and project.feishu_table_id:
+            return self._bitable_table_url(None, project.feishu_app_token, project.feishu_table_id)
+        return None
+
+    def _project_folder_url(self, project: Project) -> str | None:
+        folder_url = str((project.workflow_config or {}).get("folder_url") or "").strip()
+        if folder_url:
+            return folder_url
+        if project.feishu_folder_token:
+            return self._drive_url(project.feishu_folder_token)
+        return None
+
     def _bitable_table_url(self, app_url: str | None, app_token: str, table_id: str) -> str:
         base_url = app_url or f"{self._feishu_site_url()}/base/{app_token}"
         separator = "&" if "?" in base_url else "?"
@@ -932,6 +1063,14 @@ class FeishuStoryboardService:
         if kind == "video":
             return normalize_video_model(model)
         return model
+
+    def _default_video_duration(self, project: Project) -> float:
+        video_config = (project.model_config or {}).get("video") or {}
+        duration = video_config.get("duration_seconds") or (project.workflow_config or {}).get("duration_seconds") or 5
+        try:
+            return float(duration)
+        except (TypeError, ValueError):
+            return 5.0
 
     def _transition_alignment_state(self, shots: list[Shot]) -> str:
         if not shots:

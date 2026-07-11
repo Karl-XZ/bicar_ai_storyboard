@@ -15,3 +15,4 @@ class ChatSessionPreference(TimestampMixin, Base):
     chatbot_text_model: Mapped[str] = mapped_column(String(255), nullable=False)
     agent_runtime: Mapped[str] = mapped_column(String(32), nullable=False, default="codex")
     agent_session_nonce: Mapped[int] = mapped_column(Integer, nullable=False, default=0)
+    active_project_id: Mapped[str | None] = mapped_column(String(36), index=True)

@@ -39,6 +39,20 @@ class ChatPreferenceService:
         value = str(preference.agent_runtime or "").strip() if preference else ""
         return value or "codex"
 
+    def get_active_project_id(
+        self,
+        *,
+        chat_id: str | None,
+        chat_type: str | None,
+        sender_open_id: str | None,
+    ) -> str | None:
+        session = resolve_chat_session(chat_id=chat_id, chat_type=chat_type, sender_open_id=sender_open_id)
+        preference = self.db.scalar(
+            select(ChatSessionPreference).where(ChatSessionPreference.session_key == session.session_key)
+        )
+        value = str(preference.active_project_id or "").strip() if preference else ""
+        return value or None
+
     def get_assistant_mode(
         self,
         *,
@@ -111,6 +125,38 @@ class ChatPreferenceService:
             preference.chat_id = session.chat_id
             preference.sender_open_id = session.sender_open_id
             preference.assistant_mode = mode
+        self.db.flush()
+        return preference
+
+    def set_active_project_id(
+        self,
+        *,
+        chat_id: str | None,
+        chat_type: str | None,
+        sender_open_id: str | None,
+        project_id: str | None,
+    ) -> ChatSessionPreference:
+        session = resolve_chat_session(chat_id=chat_id, chat_type=chat_type, sender_open_id=sender_open_id)
+        preference = self.db.scalar(
+            select(ChatSessionPreference).where(ChatSessionPreference.session_key == session.session_key)
+        )
+        if not preference:
+            preference = ChatSessionPreference(
+                session_key=session.session_key,
+                session_type=session.session_type,
+                chat_id=session.chat_id,
+                sender_open_id=session.sender_open_id,
+                assistant_mode="chat",
+                chatbot_text_model="",
+                agent_runtime="codex",
+                active_project_id=project_id,
+            )
+            self.db.add(preference)
+        else:
+            preference.session_type = session.session_type
+            preference.chat_id = session.chat_id
+            preference.sender_open_id = session.sender_open_id
+            preference.active_project_id = project_id
         self.db.flush()
         return preference
 

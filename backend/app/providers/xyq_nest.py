@@ -18,6 +18,7 @@ SUBMIT_RUN_PATH = "/api/biz/v1/skill/submit_run"
 GET_THREAD_PATH = "/api/biz/v1/skill/get_thread"
 UPLOAD_FILE_PATH = "/api/biz/v1/skill/upload_file"
 VIDEO_SUFFIXES = (".mp4", ".mov", ".webm", ".m4v", ".avi", ".mkv")
+_XYQ_SUBMIT_LOCK = asyncio.Lock()
 
 
 class XYQNestProviderError(RuntimeError):
@@ -40,13 +41,14 @@ class _TaskRef:
 class XYQNestVideoProvider(VideoProvider):
     async def create_video_task(self, payload: dict) -> VideoTaskResult:
         access_key = _require_access_key()
-        uploaded_assets = await _upload_assets_from_payload(payload, access_key)
-        body = {
-            "message": _build_video_message(payload, uploaded_assets),
-        }
-        if uploaded_assets:
-            body["asset_ids"] = [asset.asset_id for asset in uploaded_assets]
-        data = await _api_post(path=SUBMIT_RUN_PATH, access_key=access_key, body=body, timeout=60)
+        async with _XYQ_SUBMIT_LOCK:
+            uploaded_assets = await _upload_assets_from_payload(payload, access_key)
+            body = {
+                "message": _build_video_message(payload, uploaded_assets),
+            }
+            if uploaded_assets:
+                body["asset_ids"] = [asset.asset_id for asset in uploaded_assets]
+            data = await _api_post(path=SUBMIT_RUN_PATH, access_key=access_key, body=body, timeout=60)
         run = data.get("run") or {}
         thread_id = str(run.get("thread_id") or "").strip()
         run_id = str(run.get("run_id") or "").strip()
@@ -245,23 +247,43 @@ def _build_video_message(payload: dict, uploaded_assets: list[_UploadedAsset]) -
     camera_motion = str(payload.get("camera_motion") or "").strip()
     negative_prompt = str(payload.get("negative_prompt") or "").strip()
     duration_seconds = payload.get("duration_seconds")
+    keyframe_time_seconds = payload.get("keyframe_time_seconds")
     model = normalize_video_model(payload.get("model") or payload.get("model_id") or settings.xyq_video_model)
     if camera_motion:
         lines.append(f"镜头运动：{camera_motion}")
     if negative_prompt:
         lines.append(f"避免出现：{negative_prompt}")
     if duration_seconds:
-        lines.append(f"目标时长：{int(duration_seconds)} 秒")
+        lines.append(f"目标时长：{_format_seconds(duration_seconds)} 秒")
     if model:
         lines.append(f"任务标记：{model or VIDEO_MODEL_XYQ}")
     if uploaded_assets:
         lines.append("附件说明：")
         for index, asset in enumerate(uploaded_assets, start=1):
             lines.append(f"{index}. {asset.label}")
-        lines.append("如果同时存在首帧和尾帧，请将首帧作为起点、尾帧作为终点，生成自然连贯的镜头过渡。")
+        lines.append("首尾帧强约束：")
+        lines.append("- 第一帧必须尽可能贴近“首帧参考”的主体、构图、机位和动作起点。")
+        lines.append("- 最后一帧必须尽可能贴近“尾帧参考”的主体、构图、机位和动作终点。")
+        lines.append("- 不允许把尾帧内容提前到开头，也不允许把首帧内容拖到结尾。")
+        lines.append("- 中间过程只能从首帧自然过渡到尾帧，不能交换起止语义。")
         lines.append("其他附件用于主体、风格、服装、场景和光线一致性参考。")
+    if payload.get("keyframe_urls") and keyframe_time_seconds is not None:
+        lines.append(
+            f"关键帧时间约束：关键帧参考应出现在第 {_format_seconds(keyframe_time_seconds)} 秒附近，"
+            "前后运动必须自然衔接，不能把关键帧当作首帧或尾帧。"
+        )
     lines.append("输出要求：直接产出最终视频，保持角色、服装、光线和空间关系稳定。")
     return "\n".join(lines)
+
+
+def _format_seconds(value) -> str:
+    try:
+        seconds = float(value)
+    except (TypeError, ValueError):
+        return str(value)
+    if seconds.is_integer():
+        return str(int(seconds))
+    return f"{seconds:.2f}".rstrip("0").rstrip(".")
 
 
 def _encode_task_ref(task_ref: _TaskRef) -> str:

@@ -13,6 +13,7 @@ class StoryboardField:
 STORYBOARD_FIELDS: tuple[StoryboardField, ...] = (
     StoryboardField("场景描述", True, "粗略分镜描述"),
     StoryboardField("参考图", False, "视觉方向参考"),
+    StoryboardField("参考图批注", False, "说明参考图用于镜头中的哪一部分，例如服装/构图/光线/机位/道具"),
     StoryboardField("关键帧提示词", False, "核心画面 Prompt"),
     StoryboardField("首帧提示词", False, "镜头起始画面 Prompt"),
     StoryboardField("尾帧提示词", False, "镜头结束画面 Prompt"),
@@ -27,7 +28,8 @@ STORYBOARD_FIELDS: tuple[StoryboardField, ...] = (
     StoryboardField("图片模型", False, "默认 DashScope 万相，也可切换其他图片模型"),
     StoryboardField("图片生成状态", True, "图片生成控制"),
     StoryboardField("关键帧图", False, "AI 生成候选"),
-    StoryboardField("选中关键帧图", False, "视频输入"),
+    StoryboardField("选中关键帧图", False, "视频输入：空置=不使用关键帧；填入/选择附件后作为视频中间关键帧参考"),
+    StoryboardField("关键帧时间点", False, "可选：关键帧应出现在视频第几秒，允许小数"),
     StoryboardField("首帧图", False, "视频输入"),
     StoryboardField("尾帧图", False, "视频输入"),
     StoryboardField("审核状态", True, "人工审核记录"),
@@ -37,6 +39,7 @@ STORYBOARD_FIELDS: tuple[StoryboardField, ...] = (
     StoryboardField("重新生成状态", True, "选择启动后按重生成选项执行"),
     StoryboardField("视频链接", False, "视频结果"),
     StoryboardField("视频模型", False, "视频生成模型"),
+    StoryboardField("视频时长", False, "视频总长度，单位秒；默认 5，允许小数"),
     StoryboardField("满意度", False, "满意/不满意"),
     StoryboardField("归档链接", False, "复用路径"),
     StoryboardField("错误信息", False, "失败排错"),
@@ -79,7 +82,7 @@ def bitable_field_definitions() -> list[dict]:
         "视频模型",
     }
     multi_select_fields = {"需要重新生成的选项"}
-    number_fields = {"Prompt 版本"}
+    number_fields = {"Prompt 版本", "关键帧时间点", "视频时长"}
     fields = []
     for field in STORYBOARD_FIELDS:
         if field.name in attachment_fields:

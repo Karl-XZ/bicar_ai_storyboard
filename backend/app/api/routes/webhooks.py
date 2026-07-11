@@ -10,8 +10,10 @@ from app.core.config import settings
 from app.db.session import get_db
 from app.domain.schemas import ApiResponse
 from app.services.bot_commands import _is_help_command, _parse_create_project_command, handle_bot_text, handle_card_action
+from app.services.debug_paper_form import DebugPaperFormService
 from app.services.feishu_storyboard import FeishuStoryboardService
 from app.services.projects import ProjectService
+from app.services.video_downloads import VideoDownloadService
 
 router = APIRouter()
 
@@ -31,7 +33,7 @@ async def feishu_events(request: Request, db: Session = Depends(get_db)):
         sender = event_data.get("sender", {}) or {}
         sender_id = sender.get("sender_id", {}) or {}
         text = _message_text(message)
-        chat_id = message.get("chat_id") or settings.feishu_default_chat_id
+        chat_id = message.get("chat_id")
         result = await handle_bot_text(
             db,
             text=text,
@@ -46,6 +48,13 @@ async def feishu_events(request: Request, db: Session = Depends(get_db)):
                 message=result["message"],
                 data=result["data"],
             )
+    if event_type == "drive.file.bitable_record_changed_v1":
+        processed = await _process_bitable_change(db, event.get("event", {}))
+        return ApiResponse(
+            request_id=request.headers.get("x-request-id", f"req_{uuid4().hex}"),
+            message="多维表格记录变更事件已处理",
+            data={"processed": processed, "event_type": event_type, "job_id": str(uuid4())},
+        )
     return ApiResponse(
         request_id=request.headers.get("x-request-id", f"req_{uuid4().hex}"),
         message="飞书事件已接收",
@@ -70,7 +79,18 @@ async def feishu_card_actions(request: Request, db: Session = Depends(get_db)) -
 async def feishu_bitable_trigger(request: Request, db: Session = Depends(get_db)) -> ApiResponse:
     payload = parse_event_body(await request.body(), settings.feishu_encrypt_key)
     event = payload.get("event", payload)
+    processed = await _process_bitable_change(db, event)
+    return ApiResponse(
+        request_id=request.headers.get("x-request-id", f"req_{uuid4().hex}"),
+        message="多维表格触发器已接收",
+        data={"processed": processed, "job_id": str(uuid4())},
+    )
+
+
+async def _process_bitable_change(db: Session, event: dict) -> int:
     app_token = event.get("app_token") or event.get("appToken")
+    if not app_token:
+        app_token = event.get("file_token") or event.get("fileToken")
     table_id = event.get("table_id") or event.get("tableId")
     project = ProjectService(db).find_by_feishu_table(app_token, table_id) if app_token else None
     processed = 0
@@ -83,11 +103,45 @@ async def feishu_bitable_trigger(request: Request, db: Session = Depends(get_db)
         else:
             shots = await service.sync_from_feishu(project)
             processed = len(shots)
-    return ApiResponse(
-        request_id=request.headers.get("x-request-id", f"req_{uuid4().hex}"),
-        message="多维表格触发器已接收",
-        data={"processed": processed, "job_id": str(uuid4())},
-    )
+    elif app_token and table_id:
+        record_ids = _bitable_record_ids(event)
+        debug_paper = DebugPaperFormService()
+        if await debug_paper.handles_table(app_token, table_id):
+            for record_id in record_ids:
+                await debug_paper.process_record_by_table(
+                    app_token=app_token,
+                    table_id=table_id,
+                    record_id=str(record_id),
+                )
+                processed += 1
+        else:
+            video_downloads = VideoDownloadService()
+            if await video_downloads.handles_table(app_token, table_id):
+                for record_id in record_ids:
+                    await video_downloads.process_record_by_table(
+                        app_token=app_token,
+                        table_id=table_id,
+                        record_id=str(record_id),
+                    )
+                    processed += 1
+    return processed
+
+
+def _bitable_record_ids(event: dict) -> list[str]:
+    record_ids: list[str] = []
+    record = event.get("record") or {}
+    if record.get("record_id"):
+        record_ids.append(str(record["record_id"]))
+    for key in ("record_id", "recordId"):
+        if event.get(key):
+            record_ids.append(str(event[key]))
+    for action in event.get("action_list") or event.get("actionList") or []:
+        if action.get("action") == "record_deleted":
+            continue
+        record_id = action.get("record_id") or action.get("recordId")
+        if record_id:
+            record_ids.append(str(record_id))
+    return list(dict.fromkeys(record_ids))
 
 
 def _message_text(message: dict) -> str:

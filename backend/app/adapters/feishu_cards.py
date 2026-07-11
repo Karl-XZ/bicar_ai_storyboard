@@ -134,6 +134,7 @@ def chatbot_reply_card(
 def render_feishu_markdown(content: str) -> str:
     text = (content or "").strip() or "我暂时没有生成有效回复。"
     text = _downgrade_unsupported_headings(text)
+    text = _expand_markdown_links(text)
     return _convert_markdown_tables(text)
 
 
@@ -151,6 +152,17 @@ def _downgrade_unsupported_headings(text: str) -> str:
         else:
             lines.append(line)
     return "\n".join(lines)
+
+
+def _expand_markdown_links(text: str) -> str:
+    def replacer(match: re.Match[str]) -> str:
+        label = match.group(1).strip()
+        url = match.group(2).strip()
+        if not label:
+            return url
+        return f"{label}：{url}"
+
+    return re.sub(r"\[([^\]]+)\]\((https?://[^\s)]+)\)", replacer, text)
 
 
 def _convert_markdown_tables(text: str) -> str:
@@ -264,12 +276,16 @@ def help_card() -> dict:
             "- `/分镜助手` / `/视频助手`：把当前会话切到分镜工作流助手",
             "- `/Deep Research`：把当前会话切到深度研究模式，后续会联网检索并把研究结果保存为飞书文档",
             "- `/拆分镜需求` / `/分镜拆解`：读取你提供的飞书云文档、飞书文件或脚本文字，拆成镜头级分镜需求，并保存为飞书文档",
+            "- `/调试纸二维码`：获取飞书原生表单入口；扫码/打开后登录飞书并填写副本名，系统会复制 `调试纸CN.docx` 并在表格回填副本链接",
             "- `/help` / `/帮助` / `/菜单`：查看这张说明卡片",
             "- `/New session`：重置当前群聊或私聊会话的聊天记录，不影响项目和模型设置",
             "- `/新建分镜项目：项目名`：创建分镜表和项目文件夹",
             "- `/新建分镜项目：项目名 https://xxx.feishu.cn/drive/folder/FILE_TOKEN`：在指定飞书文件夹下创建项目",
+            "- `/切换当前项目 <表格链接>`：把当前群聊或私聊绑定到指定分镜表，后续进度查询和 Agent 默认都优先使用这个项目",
             "- `/新建项目：项目名` / `/新建：项目名` / `/new：项目名`：同样创建项目",
             "- `/新建 AI 分镜项目`：创建一个未命名项目，后续再改名",
+            "- `/视频拆分镜 视频=https://xxx.feishu.cn/file/FILE_TOKEN 项目名=项目名`：下载视频、抽帧、用视觉模型分析，并创建可编辑分镜表；同义命令 `/视频转分镜`、`/从视频生成分镜表`",
+            "- `/视频拆分镜 ... 镜头数=10 抽帧数=12 目录=https://xxx.feishu.cn/drive/folder/FOLDER_TOKEN`：可指定分镜行数、抽帧数量和项目创建位置",
             "- `/优化当前批次 Prompt`：优化最近项目的 batch_001",
             "- `/生成全部图片`：为最近项目所有分镜生成首帧和尾帧；关键帧需先启动关键帧生成",
             "- `/生成全部视频`：为最近项目生成视频；有首尾帧/参考图就使用，没有图片就按文字生成",
@@ -280,7 +296,7 @@ def help_card() -> dict:
             "- 如果切到 OpenRouter 的 Gemini 聊天模型，chatbot 现在会按需调用联网搜索，适合问最新公开资料、新闻、公司动态和市场信息",
             "- 如果切到 DeepSeek 聊天模型，系统也会在需要时先做公开网页搜索，再把结果提供给模型回答",
             "- `/直接生成图片`：按命令直接调用图片模型；必填 `模型=`、`提示词=`，可选 `尺寸=`、`参考图=`",
-            "- `/直接生成视频`：按命令直接调用视频模型；必填 `模型=`、`提示词=`，可选 `时长=`、`首帧=`、`尾帧=`、`参考图=`、`关键帧=`",
+            "- `/直接生成视频`：按命令直接调用视频模型；必填 `模型=`、`提示词=`，可选 `时长=`、`首帧=`、`尾帧=`、`参考图=`、`关键帧=`、`关键帧时间点=`",
             "- `/同步表格`：补齐默认值并同步分镜行",
             "- `/查看进度`：查看最近项目进度",
             "- Deep Research 模式下如果消息里附带飞书文档/文件链接，系统会读取文档内容或文本文件内容，再结合联网结果写研究报告",
@@ -298,8 +314,11 @@ def help_card() -> dict:
             "- `/直接生成视频`",
             "- `模型=小云雀`",
             "- `提示词=镜头缓慢推近，蒸汽自然上升`",
+            "- `时长=5` 或 `时长=3.5`",
             "- `首帧=https://xxx.feishu.cn/file/A`",
             "- `尾帧=https://xxx.feishu.cn/file/B`",
+            "- `关键帧=https://xxx.feishu.cn/file/C`",
+            "- `关键帧时间点=2.5`",
             "",
             "**项目创建后常用按钮**",
             "",
@@ -318,6 +337,8 @@ def help_card() -> dict:
             "- 看图不满意，把 `审核状态` 改成 `驳回`，并填写 `驳回原因`",
             "- 想重生成单条图片，把 `图片生成状态` 改成 `启动`",
             "- 想生成或重生成单条视频，把 `生成状态` 改成 `启动`",
+            "- 想指定单镜视频长度，填写 `视频时长`，默认 5 秒，允许小数",
+            "- 想使用中间关键帧，把图片放到 `选中关键帧图`，并可在 `关键帧时间点` 填第几秒出现；空置表示不使用中间关键帧",
             "- 想按驳回原因重做，选择 `需要重新生成的选项` 后把 `重新生成状态` 改成 `启动`",
             "- 看完视频后，在 `满意度` 里选 `满意` 或 `不满意`",
             "",
@@ -445,29 +466,41 @@ def batch_done_card(*, project_id: str, batch_no: str, rows: list[tuple[str, str
     }
 
 
-def progress_card(*, project_name: str, stats: dict, table_url: str | None = None, project_id: str | None = None) -> dict:
-    content = "\n".join(
-        [
-            f"**{project_name}**",
-            "",
-            "当前进度：",
-            f"- 镜头总数：{stats.get('total', 0)}",
-            f"- Prompt：{stats.get('prompt_optimized', 0)} 已优化 / {stats.get('prompt_pending', 0)} 待优化",
-            f"- 图片：首帧 {stats.get('first_frames', 0)} / 尾帧 {stats.get('last_frames', 0)} / 关键帧 {stats.get('keyframe_shots', 0)}",
-            f"- 图片生成：{stats.get('image_generating', 0)} 正在生成 / {stats.get('image_done', 0)} 生成完成",
-            f"- 视频：{stats.get('videos', 0)} 已生成",
-            f"- 视频生成：{stats.get('video_generating', 0)} 正在生成 / {stats.get('video_done', 0)} 生成完成",
-            f"- 首尾帧同步：{stats.get('transition_alignment_state') or ('已启动' if stats.get('transition_alignment_enabled') else '未启动')}",
-            f"- 关键帧生成：{stats.get('keyframe_generation_state') or ('已启动' if stats.get('keyframe_generation_enabled') else '未启动')}",
-            f"- 待生成：{stats.get('pending_frames', 0)}",
-            f"- 帧生成中：{stats.get('frames_generating', 0)}",
-            f"- 待审核：{stats.get('pending_review', 0)}",
-            f"- 视频生成中：{stats.get('video_generating', 0)}",
-            f"- 待验收：{stats.get('pending_acceptance', 0)}",
-            f"- 已归档：{stats.get('archived', 0)}",
-            f"- 错误：{stats.get('errors', 0)}",
-        ]
-    )
+def progress_card(
+    *,
+    project_name: str,
+    stats: dict,
+    table_url: str | None = None,
+    folder_url: str | None = None,
+    project_id: str | None = None,
+) -> dict:
+    lines = [
+        f"**{project_name}**",
+        "",
+        "当前进度：",
+        f"- 镜头总数：{stats.get('total', 0)}",
+        f"- Prompt：{stats.get('prompt_optimized', 0)} 已优化 / {stats.get('prompt_pending', 0)} 待优化",
+        f"- 图片：首帧 {stats.get('first_frames', 0)} / 尾帧 {stats.get('last_frames', 0)} / 关键帧 {stats.get('keyframe_shots', 0)}",
+        f"- 图片生成：{stats.get('image_generating', 0)} 正在生成 / {stats.get('image_done', 0)} 生成完成",
+        f"- 视频：{stats.get('videos', 0)} 已生成",
+        f"- 视频生成：{stats.get('video_generating', 0)} 正在生成 / {stats.get('video_done', 0)} 生成完成",
+        f"- 首尾帧同步：{stats.get('transition_alignment_state') or ('已启动' if stats.get('transition_alignment_enabled') else '未启动')}",
+        f"- 关键帧生成：{stats.get('keyframe_generation_state') or ('已启动' if stats.get('keyframe_generation_enabled') else '未启动')}",
+        f"- 待生成：{stats.get('pending_frames', 0)}",
+        f"- 帧生成中：{stats.get('frames_generating', 0)}",
+        f"- 待审核：{stats.get('pending_review', 0)}",
+        f"- 视频生成中：{stats.get('video_generating', 0)}",
+        f"- 待验收：{stats.get('pending_acceptance', 0)}",
+        f"- 已归档：{stats.get('archived', 0)}",
+        f"- 错误：{stats.get('errors', 0)}",
+    ]
+    if table_url:
+        lines.append(f"- 表格链接：{table_url}")
+    else:
+        lines.append("- 表格链接：未配置")
+    if folder_url:
+        lines.append(f"- 项目文件夹链接：{folder_url}")
+    content = "\n".join(lines)
     if stats.get("error_items"):
         content += "\n\n最近错误：\n" + "\n".join(
             f"- 镜头 {item.get('shot_no')}：{item.get('code') or 'ERROR'} {item.get('message') or ''}" for item in stats["error_items"]
